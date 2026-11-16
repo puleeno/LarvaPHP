@@ -1,0 +1,39 @@
+[package]
+name = "larva-php"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "LarvaPHP - a modern PHP application server written in Rust, based on FrankenPHP"
+
+[dependencies]
+larva-php-sys = { workspace = true }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam = { workspace = true }
+dashmap = { workspace = true }
+arc-swap = { workspace = true }
+once_cell = { workspace = true }
+libc = { workspace = true }
+
+[features]
+default = ["mercure", "watcher"]
+mercure = []
+watcher = []
+hotreload = ["mercure", "watcher"]
+
+[[bin]]
+name = "larva-php"
+path = "src/main.rs"

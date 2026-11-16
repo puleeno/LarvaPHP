@@ -1,0 +1,22 @@
+[package]
+name = "larva-php-extgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "PHP extension generator for LarvaPHP"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }
+glob = { workspace = true }
+once_cell = { workspace = true }
+parking_lot = { workspace = true }
