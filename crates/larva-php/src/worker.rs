@@ -3,12 +3,11 @@
 //! Mirrors `worker.go` from the Go source.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::{Arc, RwLock};
 
 use crate::context::PhpContext;
 use crate::errors::{Error, Result};
-use crate::server::Server;
 use crate::thread::PhpThread;
 
 /// A worker script and its associated threads.
@@ -25,7 +24,7 @@ pub struct Worker {
     on_thread_ready: Option<Box<dyn Fn(i32) + Send + Sync>>,
     on_thread_shutdown: Option<Box<dyn Fn(i32) + Send + Sync>>,
     queued_requests: AtomicI32,
-    server: Option<Arc<Server>>,
+    server: Option<Arc<crate::server::Server>>,
     stopped: AtomicBool,
 }
 
@@ -38,7 +37,7 @@ impl Worker {
         num: i32,
         max_threads: i32,
         max_consecutive_failures: i32,
-        server: Option<Arc<Server>>,
+        server: Option<Arc<crate::server::Server>>,
     ) -> Self {
         Worker {
             name,
@@ -74,7 +73,7 @@ impl Worker {
         self.match_request.as_deref()
     }
 
-    pub fn server(&self) -> Option<&Arc<Server>> {
+    pub fn server(&self) -> Option<&Arc<crate::server::Server>> {
         self.server.as_ref()
     }
 
@@ -173,10 +172,10 @@ pub fn resolve_worker_file(file_name: &str) -> Result<(String, String)> {
 pub fn check_worker_declaration(
     file_name: &str,
     name: &str,
-    server: Option<&Arc<Server>>,
+    server: Option<&Arc<crate::server::Server>>,
     match_request: bool,
     name_taken: impl Fn(&str) -> bool,
-    path_taken: impl Fn(Option<&Arc<Server>>, &str) -> bool,
+    path_taken: impl Fn(Option<&Arc<crate::server::Server>>, &str) -> bool,
 ) -> Result<()> {
     if server.is_none() {
         if path_taken(None, file_name) {

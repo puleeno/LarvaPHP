@@ -28,7 +28,7 @@ pub mod imp {
             Hub {}
         }
 
-        pub fn publish(&self, update: &Update) -> Result<String> {
+        pub fn publish(&self, _update: &Update) -> Result<String> {
             // TODO: implement publish
             Ok(String::new())
         }

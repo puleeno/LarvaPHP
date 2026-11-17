@@ -4,7 +4,7 @@
 //! Rust values and PHP zvals.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
 

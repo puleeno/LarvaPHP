@@ -3,11 +3,10 @@
 //! Mirrors `cgi.go` and `cgimethods.go` from the Go source.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::errors::{Error, Result};
 use crate::ffi;
-use crate::types::PhpValue;
 
 /// Fast absolute path resolution.
 pub mod fastabs {

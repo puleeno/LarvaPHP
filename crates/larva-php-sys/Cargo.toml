@@ -12,3 +12,4 @@ libc.workspace = true
 
 [build-dependencies]
 bindgen = "0.70"
+cc = "1"

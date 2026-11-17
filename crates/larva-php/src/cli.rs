@@ -5,7 +5,6 @@
 use std::ffi::CString;
 use std::os::raw::c_char;
 
-use crate::errors::Result;
 use crate::ffi;
 use crate::options::{Opt, Option};
 

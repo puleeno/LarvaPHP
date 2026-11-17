@@ -5,7 +5,7 @@
 use std::sync::{Arc, RwLock};
 
 /// A mapping from server name to LarvaPHP module.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServerName {
     pub name: String,
     pub module: Arc<crate::LarvaPHPModule>,

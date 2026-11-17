@@ -6,26 +6,26 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::context::PhpContext;
+use crate::context::{PhpContext, RequestOption};
 use crate::errors::{Error, Result};
-use crate::options::RequestOption;
 use crate::worker::Worker;
+use tracing::Level;
 
 /// A preconfigured server block.
 ///
 /// Requests and workers can be scoped to a Server.
 pub struct Server {
-    idx: i32,
-    configured_name: String,
-    name: String,
-    root: String,
-    split_path: Vec<String>,
-    env: HashMap<String, String>,
-    workers: RwLock<Vec<Arc<Worker>>>,
-    workers_by_path: RwLock<HashMap<String, Arc<Worker>>>,
-    workers_with_request_matcher: RwLock<Vec<Arc<Worker>>>,
-    is_registered: AtomicBool,
-    logger_level: tracing::Level,
+    pub idx: i32,
+    pub configured_name: String,
+    pub name: String,
+    pub root: String,
+    pub split_path: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub workers: RwLock<Vec<Arc<Worker>>>,
+    pub workers_by_path: RwLock<HashMap<String, Arc<Worker>>>,
+    pub workers_with_request_matcher: RwLock<Vec<Arc<Worker>>>,
+    pub is_registered: AtomicBool,
+    pub logger_level: Level,
 }
 
 impl Server {
@@ -47,7 +47,7 @@ impl Server {
             workers_by_path: RwLock::new(HashMap::new()),
             workers_with_request_matcher: RwLock::new(Vec::new()),
             is_registered: AtomicBool::new(false),
-            logger_level: tracing::Level::INFO,
+            logger_level: Level::INFO,
         })
     }
 
@@ -64,7 +64,7 @@ impl Server {
             workers_by_path: RwLock::new(HashMap::new()),
             workers_with_request_matcher: RwLock::new(Vec::new()),
             is_registered: AtomicBool::new(true),
-            logger_level: tracing::Level::INFO,
+            logger_level: Level::INFO,
         }
     }
 
@@ -84,7 +84,7 @@ impl Server {
     }
 
     /// Get the logger level.
-    pub fn logger_level(&self) -> tracing::Level {
+    pub fn logger_level(&self) -> Level {
         self.logger_level
     }
 

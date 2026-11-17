@@ -2,8 +2,8 @@
 //!
 //! Mirrors `caddy/module.go` from the Go source.
 
-use std::sync::Arc;
-
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty};
 use larva_php::errors::Result;
 use larva_php::options::RequestOption;
 
@@ -14,11 +14,11 @@ impl LarvaPHPModule {
     pub async fn serve_http(
         &self,
         _req: hyper::Request<hyper::body::Incoming>,
-    ) -> Result<hyper::Response<hyper::body::Incoming>> {
+    ) -> Result<hyper::Response<http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>>> {
         // TODO: implement full request handling
         Ok(hyper::Response::builder()
             .status(200)
-            .body(hyper::body::Incoming::empty())
+            .body(Empty::<Bytes>::new().boxed())
             .unwrap())
     }
 

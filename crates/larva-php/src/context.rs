@@ -3,17 +3,17 @@
 //! Mirrors `context.go` from the Go source. Holds the request context that
 //! is passed to PHP threads for execution.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::errors::{Error, Result, RejectedError};
-use crate::options::RequestOption;
-use crate::thread::PhpThread;
-use crate::worker::Worker;
-use crate::server::Server;
+use crate::errors::{Error, Result};
 use crate::env::PreparedEnv;
+
+/// Trait for options that configure a request.
+pub trait RequestOption: Send + Sync {
+    fn apply(&self, ctx: &mut PhpContext) -> Result<()>;
+}
 
 /// The context for a single PHP request.
 ///
@@ -30,9 +30,9 @@ pub struct PhpContext {
     /// Logger for this request
     pub logger: tracing::Level,
     /// The assigned worker (if any)
-    pub worker: Option<Arc<Worker>>,
+    pub worker: Option<Arc<crate::worker::Worker>>,
     /// The server block
-    pub server: Arc<Server>,
+    pub server: Arc<crate::server::Server>,
     /// Request body idle timeout
     pub request_body_timeout: Option<std::time::Duration>,
     /// Document URI (path minus PATH_INFO)
@@ -66,7 +66,7 @@ impl PhpContext {
     /// Create a new context from an HTTP request.
     pub fn from_request(
         request: &hyper::Request<hyper::body::Incoming>,
-        server: Arc<Server>,
+        server: Arc<crate::server::Server>,
         opts: Vec<Box<dyn RequestOption>>,
     ) -> Result<Self> {
         let req_uri = request.uri().to_string();
@@ -100,9 +100,9 @@ impl PhpContext {
     }
 
     /// Create a dummy context for worker startup.
-    pub fn worker_dummy(worker: &Arc<Worker>) -> Self {
+    pub fn worker_dummy(worker: &Arc<crate::worker::Worker>) -> Self {
         let server = worker.server().cloned().unwrap_or_else(|| {
-            Arc::new(Server::fallback())
+            Arc::new(crate::server::Server::fallback())
         });
 
         PhpContext {
@@ -128,10 +128,10 @@ impl PhpContext {
     }
 
     /// Create a context from a message (for external workers).
-    pub fn from_message(
+pub fn from_message(
         message: crate::types::PhpValue,
-        server: Arc<Server>,
-        worker: Arc<Worker>,
+        server: Arc<crate::server::Server>,
+        worker: Arc<crate::worker::Worker>,
     ) -> Self {
         PhpContext {
             ctx: tokio::sync::watch::channel(None).1,

@@ -8,8 +8,6 @@ use std::time::Duration;
 use crate::context::PhpContext;
 use crate::env::PreparedEnv;
 use crate::errors::Result;
-use crate::server::Server;
-use crate::worker::Worker;
 
 /// Trait for options that configure the global LarvaPHP instance.
 pub trait Option: Send + Sync {
@@ -23,13 +21,10 @@ pub trait WorkerOption: Send + Sync {
 
 /// Trait for options that configure a server.
 pub trait ServerOption: Send + Sync {
-    fn apply(&self, server: &mut Server) -> Result<()>;
+    fn apply(&self, server: &mut crate::server::Server) -> Result<()>;
 }
 
-/// Trait for options that configure a request.
-pub trait RequestOption: Send + Sync {
-    fn apply(&self, ctx: &mut PhpContext) -> Result<()>;
-}
+pub use crate::context::RequestOption;
 
 /// Internal options struct (mirrors the `opt` struct in options.go).
 pub struct Opt {
@@ -40,7 +35,7 @@ pub struct Opt {
     pub max_wait_time: Duration,
     pub max_idle_time: Duration,
     pub max_requests: i32,
-    pub servers: Vec<std::sync::Arc<Server>>,
+    pub servers: Vec<std::sync::Arc<crate::server::Server>>,
 }
 
 impl Default for Opt {
@@ -65,8 +60,8 @@ pub struct WorkerOpt {
     pub declared_file_name: String,
     pub num: i32,
     pub max_threads: i32,
+    pub server: ::std::option::Option<::std::sync::Arc<crate::server::Server>>,
     pub env: PreparedEnv,
-    pub server: Option<std::sync::Arc<crate::server::Server>>,
     pub request_options: Vec<Box<dyn RequestOption>>,
     pub watch: Vec<String>,
     pub max_consecutive_failures: i32,
@@ -81,10 +76,10 @@ impl Default for WorkerOpt {
             num: 0,
             max_threads: 0,
             env: PreparedEnv::new(),
+            server: None,
             request_options: Vec::new(),
             watch: Vec::new(),
             max_consecutive_failures: crate::DEFAULT_MAX_CONSECUTIVE_FAILURES,
-            server: None,
         }
     }
 }
@@ -141,7 +136,7 @@ impl Option for WithMaxRequests {
     }
 }
 
-pub struct WithServer(pub std::sync::Arc<Server>);
+pub struct WithServer(pub std::sync::Arc<crate::server::Server>);
 impl Option for WithServer {
     fn apply(&self, opt: &mut Opt) -> Result<()> {
         opt.servers.push(self.0.clone());
@@ -215,7 +210,7 @@ impl WorkerOption for WithWorkerMaxFailures {
     }
 }
 
-pub struct WithWorkerServerScope(pub std::sync::Arc<Server>);
+pub struct WithWorkerServerScope(pub ::std::sync::Arc<crate::server::Server>);
 impl WorkerOption for WithWorkerServerScope {
     fn apply(&self, worker: &mut WorkerOpt) -> Result<()> {
         worker.server = Some(self.0.clone());
@@ -224,7 +219,7 @@ impl WorkerOption for WithWorkerServerScope {
 }
 
 // ============================================================================
-// Server Option builders
+// crate::server::Server Option builders
 // ============================================================================
 
 pub struct WithServerName(pub String);

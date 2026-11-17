@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use larva_php::errors::Result;
-use larva_php::options::{Option, WorkerOption};
+use larva_php::options::WorkerOption;
 use larva_php::server::Server;
 
 /// Global LarvaPHP configuration (the "frankenphp" directive in Caddyfile).
@@ -27,8 +27,8 @@ pub struct LarvaPHPApp {
     pub max_requests: i32,
 
     // Internal state
-    pub(crate) opts: RwLock<Vec<Box<dyn Option>>>,
-    pub(crate) provision_opts: RwLock<Vec<Box<dyn Option>>>,
+    pub(crate) opts: RwLock<Vec<Box<dyn larva_php::options::Option>>>,
+    pub(crate) provision_opts: RwLock<Vec<Box<dyn larva_php::options::Option>>>,
     pub(crate) modules: RwLock<Vec<Arc<LarvaPHPModule>>>,
     pub(crate) has_started: AtomicBool,
     pub(crate) started: tokio::sync::watch::Sender<Option<()>>,
@@ -54,14 +54,14 @@ impl LarvaPHPApp {
     }
 
     /// Collect all options for initialization.
-    pub fn collect_options(&self) -> Result<Vec<Box<dyn Option>>> {
-        let mut opts: Vec<Box<dyn Option>> = Vec::new();
+    pub fn collect_options(&self) -> Result<Vec<Box<dyn larva_php::options::Option>>> {
+        let mut opts: Vec<Box<dyn larva_php::options::Option>> = Vec::new();
 
         // Add provisioned options
         opts.extend(self.provision_opts.read().unwrap().iter().map(|_| {
             // Can't clone Box<dyn Option>, so we need a different approach
             // For now, return empty
-            Box::new(WithNumThreads(0)) as Box<dyn Option>
+            Box::new(WithNumThreads(0)) as Box<dyn larva_php::options::Option>
         }));
 
         Ok(opts)
@@ -97,10 +97,8 @@ impl Default for LarvaPHPApp {
     }
 }
 
-use larva_php::options::Option as _;
-
 struct WithNumThreads(i32);
-impl Option for WithNumThreads {
+impl larva_php::options::Option for WithNumThreads {
     fn apply(&self, _opt: &mut larva_php::options::Opt) -> Result<()> {
         Ok(())
     }

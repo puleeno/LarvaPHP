@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::errors::{Error, Result};
-use crate::thread::{PhpThread, ThreadState, ThreadStateContainer};
+use crate::thread::{PhpThread, ThreadState};
 use crate::worker::Worker;
 
 /// Minimum time a request must be stalled before scaling.

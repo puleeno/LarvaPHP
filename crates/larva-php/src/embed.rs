@@ -2,7 +2,7 @@
 //!
 //! Mirrors `embed.go`, `embed_unix.go`, and `embed_windows.go` from the Go source.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Path to the embedded PHP application (empty if none).
 pub static mut EMBEDDED_APP_PATH: Option<String> = None;

@@ -14,6 +14,5 @@ pub mod servername;
 pub mod workerconfig;
 
 pub use app::*;
-pub use module::*;
 pub use servername::*;
 pub use workerconfig::*;
