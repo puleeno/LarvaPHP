@@ -15,6 +15,10 @@ struct Args {
     #[arg(short = 'r', long = "root", value_name = "DIR")]
     root: Option<String>,
 
+    /// Address to bind the server to
+    #[arg(short = 'a', long = "addr", default_value = "127.0.0.1:8000")]
+    addr: String,
+
     /// Show version information
     #[arg(short = 'v', long = "version")]
     version: bool,
@@ -50,26 +54,50 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    if let Some(root) = args.root {
-        println!("LarvaPHP {} - serving from {}", VERSION, root);
-        // TODO: Initialize PHP runtime and start HTTP server
-        // This requires full PHP embed implementation
-        eprintln!("Server mode not yet fully implemented - PHP stub functions are active");
-        return ExitCode::from(1);
-    }
+    // Initialize tracing
+    tracing_subscriber::fmt::init();
 
-    if let Some(script) = args.script {
+    if let Some(root) = args.root {
+        let addr: std::net::SocketAddr = match args.addr.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("Invalid address '{}': {}", args.addr, e);
+                return ExitCode::from(1);
+            }
+        };
+
+        // Initialize PHP runtime
+        let server = larva_php::server::Server::new(&root).unwrap();
+        server.activate();
+
+        // Start PHP main thread
+        if let Err(e) = larva_php::thread::init(Vec::new()) {
+            eprintln!("Failed to initialize PHP runtime: {}", e);
+            return ExitCode::from(1);
+        }
+
+        // Start HTTP server
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            if let Err(e) = server.start_server(addr).await {
+                eprintln!("Server error: {}", e);
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
+        })
+    } else if let Some(script) = args.script {
         let script_args: Vec<String> = std::env::args().skip(2).collect();
         let status = larva_php::execute_script_cli(&script, &script_args, Vec::new());
-        return ExitCode::from(status as u8);
+        ExitCode::from(status as u8)
+    } else {
+        eprintln!("LarvaPHP {} - a modern PHP application server", VERSION);
+        eprintln!();
+        eprintln!("Usage:");
+        eprintln!("  larva-php <script.php> [args...]    Run a PHP script");
+        eprintln!("  larva-php -root <dir>               Serve PHP application from directory");
+        eprintln!("  larva-php --version                 Show version");
+        eprintln!("  larva-php --help                    Show this help");
+        ExitCode::from(1)
     }
-
-    eprintln!("LarvaPHP {} - a modern PHP application server", VERSION);
-    eprintln!();
-    eprintln!("Usage:");
-    eprintln!("  larva-php <script.php> [args...]    Run a PHP script");
-    eprintln!("  larva-php -root <dir>               Serve PHP application from directory");
-    eprintln!("  larva-php --version                 Show version");
-    eprintln!("  larva-php --help                    Show this help");
-    ExitCode::from(1)
 }

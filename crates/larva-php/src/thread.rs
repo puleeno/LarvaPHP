@@ -461,10 +461,11 @@ pub static REGISTRY: once_cell::sync::Lazy<RwLock<PhpThreadRegistry>> =
 
 /// Initialize PHP threads.
 pub fn init(options: Vec<Box<dyn crate::options::Option>>) -> Result<()> {
-    let mut registry = REGISTRY.write().unwrap();
+    let registry = REGISTRY.write().unwrap();
     if registry.is_running.swap(true, Ordering::AcqRel) {
         return Err(Error::AlreadyStarted);
     }
+    drop(registry);
 
     // Apply options
     let mut opt = crate::options::Opt::default();
@@ -472,18 +473,43 @@ pub fn init(options: Vec<Box<dyn crate::options::Option>>) -> Result<()> {
         option.apply(&mut opt)?;
     }
 
-    // TODO: implement full initialization
+    // Start the main PHP thread
+    let main_thread = Arc::new(PhpMainThread::new(opt.num_threads, opt.max_threads));
+    main_thread.state.set(ThreadState::Booting);
+    let result = unsafe { ffi::frankenphp_new_main_thread(main_thread.num_threads) };
+    if result != 0 {
+        main_thread.state.set(ThreadState::Reserved);
+        return Err(Error::MainThreadCreation);
+    }
+    main_thread.state.set(ThreadState::Ready);
+    *REGISTRY.write().unwrap().main_thread.write().unwrap() = Some(main_thread.clone());
+
+    let registry = REGISTRY.write().unwrap();
     registry.is_running.store(true, Ordering::Release);
     Ok(())
 }
 
 /// Shutdown PHP threads.
 pub fn shutdown() {
-    let mut registry = REGISTRY.write().unwrap();
+    let registry = REGISTRY.write().unwrap();
     if !registry.is_running.load(Ordering::Acquire) {
         return;
     }
-    // TODO: implement full shutdown
+
+    // Shutdown all worker threads
+    for thread_opt in registry.threads.read().unwrap().iter() {
+        if let Some(thread) = thread_opt {
+            thread.shutdown();
+        }
+    }
+
+    // Shutdown main thread
+    if let Some(main_thread) = registry.main_thread.read().unwrap().clone() {
+        main_thread.state.set(ThreadState::ShuttingDown);
+        unsafe { ffi::frankenphp_shutdown_dummy_request() };
+        main_thread.state.set(ThreadState::Done);
+    }
+
     registry.is_running.store(false, Ordering::Release);
 }
 

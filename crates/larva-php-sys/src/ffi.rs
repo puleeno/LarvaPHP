@@ -385,6 +385,7 @@ extern "C" {
     pub fn php_output_end_all();
     pub fn php_output_deactivate();
     pub fn php_output_activate();
+    pub fn php_output_get_contents() -> *mut zend_string;
     pub fn php_output_start_user(
         output_handler: *mut zval,
         chunk_size: usize,
@@ -558,6 +559,17 @@ extern "C" {
         argv: *mut *mut c_char,
         eval: bool,
     ) -> c_int;
+
+    // ========================================================================
+    // Output capture (larva-php specific)
+    // ========================================================================
+
+    /// Execute a PHP script and capture its output.
+    /// Returns a malloc'd null-terminated string (caller must free via larva_php_free_string).
+    pub fn larva_php_execute_and_capture(script_path: *const c_char) -> *mut c_char;
+
+    /// Free a string allocated by larva_php_execute_and_capture.
+    pub fn larva_php_free_string(s: *mut c_char);
 
     // ========================================================================
     // Environment variables (mirror env.go)
