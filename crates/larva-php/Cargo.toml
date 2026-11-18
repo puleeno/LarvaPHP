@@ -30,11 +30,13 @@ once_cell = { workspace = true }
 libc = { workspace = true }
 clap = { workspace = true }
 regex = { workspace = true }
+tokio-util = { version = "0.7", optional = true }
+notify = { version = "6", optional = true, features = ["default"] }
 
 [features]
 default = ["mercure", "watcher"]
 mercure = []
-watcher = []
+watcher = ["notify", "tokio-util"]
 hotreload = ["mercure", "watcher"]
 
 [[bin]]

@@ -45,6 +45,7 @@ pub mod mercure;
 #[cfg(feature = "watcher")]
 pub mod watcher;
 
+pub use config::hot_reload::HotReloadManager;
 pub use config::{
     ConfigLoader, ConfigParser, Middleware, MiddlewareChain, RewriteMiddleware, RewriteRule,
     ServerConfig, ServerConfigBuilder,
