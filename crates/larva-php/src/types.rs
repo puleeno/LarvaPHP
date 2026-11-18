@@ -410,3 +410,59 @@ pub unsafe fn call_php_callable(cb: *const ffi::zval, params: &[PhpValue]) -> Ph
     ffi::zval_ptr_dtor(&mut retval);
     go_result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn php_value_enum_variants() {
+        assert_eq!(PhpValue::Null, PhpValue::Null);
+        assert_eq!(PhpValue::Bool(true), PhpValue::Bool(true));
+        assert_eq!(PhpValue::Bool(false), PhpValue::Bool(false));
+        assert_eq!(PhpValue::Long(42), PhpValue::Long(42));
+        assert_eq!(PhpValue::Double(3.14), PhpValue::Double(3.14));
+        assert_eq!(PhpValue::String("hello".to_string()), PhpValue::String("hello".to_string()));
+    }
+
+    #[test]
+    fn associative_array_insert_and_get() {
+        let mut aa = AssociativeArray::new();
+        assert!(aa.is_empty());
+        assert_eq!(aa.len(), 0);
+
+        aa.insert("foo", PhpValue::Long(1));
+        aa.insert("bar", PhpValue::String("baz".to_string()));
+        assert_eq!(aa.len(), 2);
+        assert!(!aa.is_empty());
+
+        assert_eq!(aa.get("foo"), Some(&PhpValue::Long(1)));
+        assert_eq!(aa.get("bar"), Some(&PhpValue::String("baz".to_string())));
+        assert_eq!(aa.get("missing"), None);
+    }
+
+    #[test]
+    fn associative_array_insert_duplicate_updates_order() {
+        let mut aa = AssociativeArray::new();
+        aa.insert("a", PhpValue::Long(1));
+        aa.insert("b", PhpValue::Long(2));
+        aa.insert("a", PhpValue::Long(3));
+        assert_eq!(aa.len(), 2);
+        assert_eq!(aa.order, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(aa.get("a"), Some(&PhpValue::Long(3)));
+    }
+
+    #[test]
+    fn associative_array_default() {
+        let aa: AssociativeArray = Default::default();
+        assert!(aa.is_empty());
+    }
+
+    #[test]
+    fn php_value_debug() {
+        let v = PhpValue::Long(42);
+        assert!(format!("{:?}", v).contains("42"));
+        let v = PhpValue::String("test".to_string());
+        assert!(format!("{:?}", v).contains("test"));
+    }
+}

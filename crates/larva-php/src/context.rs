@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use crate::errors::{Error, Result};
 use crate::env::PreparedEnv;
+use crate::server::Server;
 
 /// Trait for options that configure a request.
 pub trait RequestOption: Send + Sync {
@@ -80,8 +81,8 @@ pub struct PhpContextBuilder {
 
 impl PhpContext {
     /// Create a new context from an HTTP request.
-    pub fn from_request(
-        request: &hyper::Request<hyper::body::Incoming>,
+    pub fn from_request<B>(
+        request: &hyper::Request<B>,
         server: Arc<crate::server::Server>,
         opts: Vec<Box<dyn RequestOption>>,
     ) -> Result<Self> {
@@ -264,5 +265,169 @@ pub fn from_message(
     /// Check if the context is done.
     pub fn is_done(&self) -> bool {
         self.is_done.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn test_server() -> Arc<Server> {
+        Arc::new(Server::new("C:\\www").unwrap())
+    }
+
+    #[test]
+    fn validate_rejects_null_byte() {
+        let server = test_server();
+        let ctx = PhpContext {
+            ctx: tokio::sync::watch::channel(None).1,
+            document_root: server.root().to_string(),
+            split_path: server.split_path().to_vec(),
+            env: PreparedEnv::new(),
+            logger: server.logger_level(),
+            worker: None,
+            server: server.clone(),
+            request_body_timeout: None,
+            doc_uri: String::new(),
+            path_info: String::new(),
+            script_name: String::new(),
+            script_filename: String::new(),
+            request_uri: "/test\0.php".to_string(),
+            query_string: String::new(),
+            request_method: "GET".to_string(),
+            content_type: String::new(),
+            content_length: String::new(),
+            server_protocol: "HTTP/1.1".to_string(),
+            server_name: "localhost".to_string(),
+            server_port: "80".to_string(),
+            https: "off".to_string(),
+            headers_written: false,
+            is_done: AtomicBool::new(false),
+            client_had_closed: AtomicBool::new(false),
+            started_at: Instant::now(),
+            handler_return: None,
+        };
+        assert!(ctx.validate().is_err());
+    }
+
+    #[test]
+    fn validate_allows_normal_uri() {
+        let server = test_server();
+        let req = hyper::Request::builder()
+            .uri("/index.php")
+            .body(())
+            .unwrap();
+        let ctx = PhpContext::from_request(&req, server, vec![]).unwrap();
+        assert!(ctx.validate().is_ok());
+    }
+
+    #[test]
+    fn from_request_extracts_query_string() {
+        let server = test_server();
+        let req = hyper::Request::builder()
+            .uri("/index.php?foo=bar&baz=qux")
+            .body(())
+            .unwrap();
+        let ctx = PhpContext::from_request(&req, server, vec![]).unwrap();
+        assert_eq!(ctx.query_string, "foo=bar&baz=qux");
+        assert_eq!(ctx.request_uri, "/index.php?foo=bar&baz=qux");
+    }
+
+    #[test]
+    fn from_request_extracts_method() {
+        let server = test_server();
+        let req = hyper::Request::builder()
+            .method("POST")
+            .uri("/index.php")
+            .body(())
+            .unwrap();
+        let ctx = PhpContext::from_request(&req, server, vec![]).unwrap();
+        assert_eq!(ctx.request_method, "POST");
+    }
+
+    #[test]
+    fn from_request_extracts_content_type() {
+        let server = test_server();
+        let req = hyper::Request::builder()
+            .header("content-type", "application/json")
+            .uri("/index.php")
+            .body(())
+            .unwrap();
+        let ctx = PhpContext::from_request(&req, server, vec![]).unwrap();
+        assert_eq!(ctx.content_type, "application/json");
+    }
+
+    #[test]
+    fn from_request_extracts_host() {
+        let server = test_server();
+        let req = hyper::Request::builder()
+            .header("host", "example.com:8080")
+            .uri("/index.php")
+            .body(())
+            .unwrap();
+        let ctx = PhpContext::from_request(&req, server, vec![]).unwrap();
+        assert_eq!(ctx.server_name, "example.com");
+        assert_eq!(ctx.server_port, "8080");
+    }
+
+    #[test]
+    fn from_request_defaults_host() {
+        let server = test_server();
+        let req = hyper::Request::builder()
+            .uri("/index.php")
+            .body(())
+            .unwrap();
+        let ctx = PhpContext::from_request(&req, server, vec![]).unwrap();
+        assert_eq!(ctx.server_name, "localhost");
+        assert_eq!(ctx.server_port, "80");
+    }
+
+    #[test]
+    fn from_request_defaults_https_off() {
+        let server = test_server();
+        let req = hyper::Request::builder()
+            .uri("http://example.com/index.php")
+            .body(())
+            .unwrap();
+        let ctx = PhpContext::from_request(&req, server, vec![]).unwrap();
+        assert_eq!(ctx.https, "off");
+    }
+
+    #[test]
+    fn from_request_defaults_server_protocol() {
+        let server = test_server();
+        let req = hyper::Request::builder()
+            .uri("/index.php")
+            .body(())
+            .unwrap();
+        let ctx = PhpContext::from_request(&req, server, vec![]).unwrap();
+        assert_eq!(ctx.server_protocol, "HTTP/1.1");
+    }
+
+    #[test]
+    fn close_context_marks_done() {
+        let server = test_server();
+        let req = hyper::Request::builder()
+            .uri("/index.php")
+            .body(())
+            .unwrap();
+        let ctx = PhpContext::from_request(&req, server, vec![]).unwrap();
+        assert!(!ctx.is_done());
+        ctx.close_context();
+        assert!(ctx.is_done());
+    }
+
+    #[test]
+    fn close_context_idempotent() {
+        let server = test_server();
+        let req = hyper::Request::builder()
+            .uri("/index.php")
+            .body(())
+            .unwrap();
+        let ctx = PhpContext::from_request(&req, server, vec![]).unwrap();
+        ctx.close_context();
+        ctx.close_context();
+        assert!(ctx.is_done());
     }
 }

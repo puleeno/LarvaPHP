@@ -1164,3 +1164,290 @@ fn is_sensitive_file(path: &str) -> bool {
 
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === RateLimiter tests ===
+
+    #[test]
+    fn rate_limiter_counts_requests() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 3,
+            window_secs: 60,
+        });
+
+        assert!(limiter.check("127.0.0.1"));
+        assert!(limiter.check("127.0.0.1"));
+        assert!(limiter.check("127.0.0.1"));
+        assert!(!limiter.check("127.0.0.1"));
+        assert!(!limiter.check("127.0.0.1"));
+    }
+
+    #[test]
+    fn rate_limiter_per_ip_isolation() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 1,
+            window_secs: 60,
+        });
+
+        assert!(limiter.check("1.2.3.4"));
+        assert!(!limiter.check("1.2.3.4"));
+        assert!(limiter.check("5.6.7.8"));
+        assert!(!limiter.check("5.6.7.8"));
+    }
+
+    #[test]
+    fn rate_limiter_window_reset() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 1,
+            window_secs: 0,
+        });
+        // With window_secs=0, window always expires immediately, so every request is allowed
+        assert!(limiter.check("127.0.0.1"));
+        assert!(limiter.check("127.0.0.1"));
+        assert!(limiter.check("127.0.0.1"));
+    }
+
+    #[test]
+    fn rate_limiter_clones_share_state() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 2,
+            window_secs: 60,
+        });
+        let clone = limiter.clone();
+
+        assert!(limiter.check("127.0.0.1"));
+        assert!(clone.check("127.0.0.1"));
+        assert!(!limiter.check("127.0.0.1"));
+        assert!(!clone.check("127.0.0.1"));
+    }
+
+    #[test]
+    fn rate_limiter_default_config() {
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+        assert_eq!(limiter.config.max_requests, 60);
+        assert_eq!(limiter.config.window_secs, 60);
+
+        for _ in 0..60 {
+            assert!(limiter.check("127.0.0.1"));
+        }
+        assert!(!limiter.check("127.0.0.1"));
+    }
+
+    // === Server tests ===
+
+    #[test]
+    fn server_new_sets_defaults() {
+        let server = Server::new("C:\\www").unwrap();
+        assert_eq!(server.root(), "C:\\www");
+        assert_eq!(server.split_path(), &[".php".to_string()]);
+        assert_eq!(server.max_body_size, 10 * 1024 * 1024);
+        assert!(!server.is_registered());
+    }
+
+    #[test]
+    fn server_fallback_is_registered() {
+        let server = Server::fallback();
+        assert!(server.is_registered());
+        assert_eq!(server.root(), "");
+        assert_eq!(server.max_body_size, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn server_set_name_and_split_path() {
+        let mut server = Server::new("C:\\www").unwrap();
+        server.set_name("example.com".to_string());
+        server.set_split_path(vec![".php".to_string(), ".phtml".to_string()]);
+        assert_eq!(server.name(), "example.com");
+        assert_eq!(server.split_path(), &[".php".to_string(), ".phtml".to_string()]);
+    }
+
+    // === url_decode tests ===
+
+    #[test]
+    fn url_decode_plain_string() {
+        assert_eq!(url_decode("hello"), "hello");
+    }
+
+    #[test]
+    fn url_decode_percent_encoded() {
+        assert_eq!(url_decode("%48%65%6c%6c%6f"), "Hello");
+    }
+
+    #[test]
+    fn url_decode_plus_as_space() {
+        assert_eq!(url_decode("hello+world"), "hello world");
+    }
+
+    #[test]
+    fn url_decode_mixed() {
+        assert_eq!(url_decode("%74%65%73%74+path"), "test path");
+    }
+
+    #[test]
+    fn url_decode_invalid_hex_passthrough() {
+        assert_eq!(url_decode("%ZZ"), "%ZZ");
+    }
+
+    #[test]
+    fn url_decode_empty() {
+        assert_eq!(url_decode(""), "");
+    }
+
+    // === sanitize_path tests ===
+
+    #[test]
+    fn sanitize_path_normal() {
+        let path = PathBuf::from("C:/www/index.php");
+        let result = sanitize_path(&path).unwrap();
+        assert!(result.to_string_lossy().contains("www"));
+        assert!(result.to_string_lossy().contains("index.php"));
+    }
+
+    #[test]
+    fn sanitize_path_traversal_resolves_dotdot() {
+        let path = PathBuf::from("C:/www/../../etc/passwd");
+        let result = sanitize_path(&path).unwrap();
+        // .. segments are resolved; result no longer contains www
+        let s = result.to_string_lossy().to_string();
+        assert!(!s.contains("www"));
+        assert!(s.contains("passwd"));
+    }
+
+    #[test]
+    fn sanitize_path_current_dir_ignored() {
+        let path = PathBuf::from("C:/www/./index.php");
+        let result = sanitize_path(&path).unwrap();
+        assert!(result.to_string_lossy().contains("www"));
+        assert!(result.to_string_lossy().contains("index.php"));
+    }
+
+    #[test]
+    fn sanitize_path_empty_rejected() {
+        let path = PathBuf::from("");
+        let result = sanitize_path(&path);
+        assert!(result.is_err());
+    }
+
+    // === parse_cgi_output tests ===
+
+    #[test]
+    fn parse_cgi_output_with_headers_and_body() {
+        let output = "Status: 200 OK\r\nContent-Type: text/html\r\n\r\n<body>hello</body>";
+        let (status, headers, body) = parse_cgi_output(output);
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.iter().any(|(n, v)| n == "Content-Type" && v == "text/html"));
+        assert!(!headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("Status")));
+        assert_eq!(body, b"<body>hello</body>");
+    }
+
+    #[test]
+    fn parse_cgi_output_no_headers() {
+        let output = "just a body";
+        let (status, headers, body) = parse_cgi_output(output);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"just a body");
+        // Default content-type is added when none present
+        assert!(headers.iter().any(|(n, v)| n == "content-type" && v == "text/html; charset=UTF-8"));
+    }
+
+    #[test]
+    fn parse_cgi_output_status_302() {
+        let output = "Status: 302 Found\r\nLocation: /login\r\n\r\n";
+        let (status, headers, body) = parse_cgi_output(output);
+        assert_eq!(status, StatusCode::FOUND);
+        assert!(headers.iter().any(|(n, v)| n == "Location" && v == "/login"));
+        assert_eq!(body, b"");
+    }
+
+    #[test]
+    fn parse_cgi_output_default_content_type() {
+        let output = "Status: 200 OK\r\n\r\n<body></body>";
+        let (_status, headers, _body) = parse_cgi_output(output);
+        assert!(headers.iter().any(|(n, v)| n == "content-type" && v == "text/html; charset=UTF-8"));
+    }
+
+    // === mime_type tests ===
+
+    #[test]
+    fn mime_type_css() {
+        assert_eq!(Server::mime_type("style.css"), "text/css; charset=UTF-8");
+    }
+
+    #[test]
+    fn mime_type_js() {
+        assert_eq!(Server::mime_type("app.js"), "application/javascript; charset=UTF-8");
+    }
+
+    #[test]
+    fn mime_type_html() {
+        assert_eq!(Server::mime_type("index.html"), "text/html; charset=UTF-8");
+    }
+
+    #[test]
+    fn mime_type_png() {
+        assert_eq!(Server::mime_type("image.png"), "image/png");
+    }
+
+    #[test]
+    fn mime_type_unknown() {
+        assert_eq!(Server::mime_type("file.xyz"), "application/octet-stream");
+    }
+
+    #[test]
+    fn mime_type_no_extension() {
+        assert_eq!(Server::mime_type("Makefile"), "application/octet-stream");
+    }
+
+    // === is_sensitive_file tests ===
+
+    #[test]
+    fn sensitive_file_wp_config() {
+        assert!(is_sensitive_file("C:/www/wp-config.php"));
+    }
+
+    #[test]
+    fn sensitive_file_env() {
+        assert!(is_sensitive_file("C:/www/.env"));
+    }
+
+    #[test]
+    fn sensitive_file_dot_file() {
+        assert!(is_sensitive_file("C:/www/.htaccess"));
+    }
+
+    #[test]
+    fn sensitive_file_sql() {
+        assert!(is_sensitive_file("C:/www/db.sql"));
+    }
+
+    #[test]
+    fn not_sensitive_php() {
+        assert!(!is_sensitive_file("C:/www/index.php"));
+    }
+
+    #[test]
+    fn not_sensitive_css() {
+        assert!(!is_sensitive_file("C:/www/style.css"));
+    }
+
+    #[test]
+    fn sensitive_file_git_dir() {
+        assert!(is_sensitive_file("C:/www/.git/config"));
+    }
+
+    #[test]
+    fn sensitive_file_composer_lock() {
+        assert!(is_sensitive_file("C:/www/composer.lock"));
+    }
+
+    // === http_date tests ===
+
+    #[test]
+    fn http_date_epoch() {
+        let date = http_date(0);
+        assert_eq!(date, "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+}

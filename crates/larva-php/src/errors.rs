@@ -165,3 +165,69 @@ pub fn rejected_status(err: &Error) -> Option<u16> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn err_invalid_request_path_is_rejected() {
+        let err = err_invalid_request_path();
+        assert!(is_rejected(&err));
+        assert_eq!(rejected_status(&err), Some(400));
+        assert_eq!(err.to_string(), "invalid response: invalid request path");
+    }
+
+    #[test]
+    fn err_invalid_script_path_is_rejected() {
+        let err = err_invalid_script_path();
+        assert!(is_rejected(&err));
+        assert_eq!(rejected_status(&err), Some(404));
+    }
+
+    #[test]
+    fn err_invalid_content_length_header_is_rejected() {
+        let err = err_invalid_content_length_header("abc");
+        assert!(is_rejected(&err));
+        assert_eq!(rejected_status(&err), Some(400));
+    }
+
+    #[test]
+    fn err_max_wait_time_exceeded_is_rejected() {
+        let err = err_max_wait_time_exceeded();
+        assert!(is_rejected(&err));
+        assert_eq!(rejected_status(&err), Some(503));
+    }
+
+    #[test]
+    fn err_request_body_too_large_is_rejected() {
+        let err = err_request_body_too_large();
+        assert!(is_rejected(&err));
+        assert_eq!(rejected_status(&err), Some(413));
+    }
+
+    #[test]
+    fn non_rejected_error() {
+        let err = Error::InvalidRequest;
+        assert!(!is_rejected(&err));
+        assert_eq!(rejected_status(&err), None);
+    }
+
+    #[test]
+    fn rejected_error_display() {
+        let re = RejectedError::new("test error", 418);
+        assert_eq!(re.message, "test error");
+        assert_eq!(re.status, 418);
+        assert_eq!(re.to_string(), "test error");
+    }
+
+    #[test]
+    fn error_variants_display() {
+        assert_eq!(Error::InvalidRequest.to_string(), "not a LarvaPHP request");
+        assert_eq!(Error::AlreadyStarted.to_string(), "LarvaPHP is already started");
+        assert_eq!(Error::NotRunning.to_string(), "server is not registered, you must first call init() with WithServer()");
+        assert_eq!(Error::WatcherNotEnabled.to_string(), "watcher support is not enabled");
+        assert_eq!(Error::Ffi("test ffi".to_string()).to_string(), "PHP FFI error: test ffi");
+        assert_eq!(Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "file not found")).to_string(), "IO error: file not found");
+    }
+}

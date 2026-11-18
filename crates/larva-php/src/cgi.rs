@@ -306,6 +306,169 @@ pub fn c_string_http_method(method: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_name_lowercase() {
+        assert_eq!(header_name("content-type"), "HTTP_CONTENT_TYPE");
+    }
+
+    #[test]
+    fn header_name_with_hyphen() {
+        assert_eq!(header_name("x-forwarded-for"), "HTTP_X_FORWARDED_FOR");
+    }
+
+    #[test]
+    fn header_name_already_uppercase() {
+        assert_eq!(header_name("CONTENT-TYPE"), "HTTP_CONTENT_TYPE");
+    }
+
+    #[test]
+    fn header_name_mixed() {
+        assert_eq!(header_name("User-Agent"), "HTTP_USER_AGENT");
+    }
+
+    #[test]
+    fn normalize_split_path_lowercases() {
+        let mut paths = vec![".PHP".to_string(), ".PHTML".to_string()];
+        assert!(normalize_split_path(&mut paths).is_ok());
+        assert_eq!(paths, vec![".php".to_string(), ".phtml".to_string()]);
+    }
+
+    #[test]
+    fn normalize_split_path_rejects_non_ascii() {
+        let mut paths = vec![".ph\u{80}p".to_string()];
+        assert!(normalize_split_path(&mut paths).is_err());
+    }
+
+    #[test]
+    fn split_pos_found() {
+        let path = "/index.php/extra";
+        let split_path = vec![".php".to_string()];
+        assert_eq!(split_pos(path, &split_path), 10);
+    }
+
+    #[test]
+    fn split_pos_not_found() {
+        let path = "/index.html";
+        let split_path = vec![".php".to_string()];
+        assert_eq!(split_pos(path, &split_path), -1);
+    }
+
+    #[test]
+    fn split_pos_empty_split_path() {
+        let path = "/index.php";
+        assert_eq!(split_pos(path, &[]), 0);
+    }
+
+    #[test]
+    fn split_pos_uppercase_extension() {
+        let path = "/index.PHP/extra";
+        let split_path = vec![".php".to_string()];
+        assert_eq!(split_pos(path, &split_path), 10);
+    }
+
+    #[test]
+    fn split_pos_requires_slash_after_extension() {
+        let path = "/index.phpabc";
+        let split_path = vec![".php".to_string()];
+        assert_eq!(split_pos(path, &split_path), -1);
+    }
+
+    #[test]
+    fn clean_request_path_windows_backslashes() {
+        let result = clean_request_path("C:\\www\\index.php", true);
+        assert_eq!(result, "C:/www/index.php");
+    }
+
+    #[test]
+    fn clean_request_path_unix_unchanged() {
+        let result = clean_request_path("/www/index.php", false);
+        assert_eq!(result, "/www/index.php");
+    }
+
+    #[test]
+    fn path_clean_removes_dot_segments() {
+        assert_eq!(path_clean("/a/./b/../c"), "/a/c");
+    }
+
+    #[test]
+    fn path_clean_removes_empty_segments() {
+        assert_eq!(path_clean("/a//b///c"), "/a/b/c");
+    }
+
+    #[test]
+    fn path_clean_root() {
+        assert_eq!(path_clean("/"), "/");
+    }
+
+    #[test]
+    fn sanitized_path_join_basic() {
+        let result = sanitized_path_join("/var/www", "index.php");
+        assert!(result.contains("index.php"));
+        assert!(result.contains("var") || result.contains("www"));
+    }
+
+    #[test]
+    fn sanitized_path_join_empty_root() {
+        let result = sanitized_path_join("", "index.php");
+        assert!(result.contains("index.php"));
+    }
+
+    #[test]
+    fn sanitized_path_join_trailing_slash() {
+        let result = sanitized_path_join("/var/www", "dir/");
+        assert!(result.ends_with(std::path::MAIN_SEPARATOR.to_string().as_str()) || result == "/var/www/dir");
+    }
+
+    #[test]
+    fn split_remote_addr_with_port() {
+        let (host, port) = split_remote_addr("127.0.0.1:9000");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, "9000");
+    }
+
+    #[test]
+    fn split_remote_addr_without_port() {
+        let (host, port) = split_remote_addr("127.0.0.1");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, "");
+    }
+
+    #[test]
+    fn tls_protocol_known() {
+        assert_eq!(tls_protocol(0x0303), "TLSv1.2");
+        assert_eq!(tls_protocol(0x0304), "TLSv1.3");
+        assert_eq!(tls_protocol(0x0301), "TLSv1");
+    }
+
+    #[test]
+    fn tls_protocol_unknown() {
+        assert_eq!(tls_protocol(9999), "");
+    }
+
+    #[test]
+    fn c_string_http_method_known() {
+        assert_eq!(c_string_http_method("GET"), Some("GET"));
+        assert_eq!(c_string_http_method("POST"), Some("POST"));
+    }
+
+    #[test]
+    fn c_string_http_method_unknown() {
+        assert_eq!(c_string_http_method("INVALID"), None);
+    }
+
+    #[test]
+    fn common_request_headers_contains_expected() {
+        let headers = common_request_headers();
+        assert_eq!(headers.get("Content-Type"), Some(&"HTTP_CONTENT_TYPE"));
+        assert_eq!(headers.get("User-Agent"), Some(&"HTTP_USER_AGENT"));
+        assert_eq!(headers.get("Host"), None);
+    }
+}
+
 /// Register CGI variables into the $_SERVER array.
 ///
 /// # Safety

@@ -158,3 +158,100 @@ pub unsafe fn cstr_to_string_n(ptr: *const c_char, len: usize) -> String {
     let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
     String::from_utf8_lossy(bytes).into_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_env_adds_null_terminator() {
+        let mut env = HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let prepared = prepare_env(env);
+        let key = prepared.keys().next().unwrap();
+        assert_eq!(key.last(), Some(&0));
+        assert_eq!(prepared.get(key).unwrap(), b"bar");
+    }
+
+    #[test]
+    fn prepare_env_skips_empty_keys() {
+        let mut env = HashMap::new();
+        env.insert("".to_string(), "value".to_string());
+        env.insert("VALID".to_string(), "val".to_string());
+        let prepared = prepare_env(env);
+        assert_eq!(prepared.len(), 1);
+    }
+
+    #[test]
+    fn prepare_env_already_null_terminated() {
+        let mut env = HashMap::new();
+        env.insert("FOO\0".to_string(), "bar".to_string());
+        let prepared = prepare_env(env);
+        let key = prepared.keys().next().unwrap();
+        assert_eq!(key.last(), Some(&0));
+    }
+
+    #[test]
+    fn ensure_prepared_env_adds_null_terminator() {
+        let mut env = PreparedEnv::new();
+        env.insert(b"FOO".to_vec(), b"bar".to_vec());
+        let result = ensure_prepared_env(env);
+        let key = result.keys().next().unwrap();
+        assert_eq!(key.last(), Some(&0));
+    }
+
+    #[test]
+    fn ensure_prepared_env_keeps_null_terminated() {
+        let mut env = PreparedEnv::new();
+        env.insert(b"FOO\0".to_vec(), b"bar".to_vec());
+        let result = ensure_prepared_env(env);
+        let key = result.keys().next().unwrap();
+        assert_eq!(key.last(), Some(&0));
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn ensure_prepared_env_skips_empty_keys() {
+        let mut env = PreparedEnv::new();
+        env.insert(b"".to_vec(), b"val".to_vec());
+        env.insert(b"VALID".to_vec(), b"val".to_vec());
+        let result = ensure_prepared_env(env);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn length_of_env_starts_at_zero() {
+        assert_eq!(length_of_env(), 0);
+    }
+
+    #[test]
+    fn to_cstring_valid() {
+        let result = to_cstring("hello");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().to_str().unwrap(), "hello");
+    }
+
+    #[test]
+    fn to_cstring_with_null_returns_none() {
+        let result = to_cstring("hello\0world");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn cstr_to_string_null_ptr() {
+        let result = unsafe { cstr_to_string(std::ptr::null()) };
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn cstr_to_string_n_null_ptr() {
+        let result = unsafe { cstr_to_string_n(std::ptr::null(), 5) };
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn cstr_to_string_n_zero_len() {
+        let result = unsafe { cstr_to_string_n(std::ptr::null(), 0) };
+        assert_eq!(result, "");
+    }
+}
