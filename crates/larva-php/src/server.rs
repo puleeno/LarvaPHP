@@ -7,10 +7,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
 
 use bytes::Bytes;
-use http_body::Body as _;
+use http_body_util::BodyExt;
 use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -18,6 +18,7 @@ use hyper::body::Incoming as IncomingBody;
 use hyper_util::server::conn::auto;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
+use dashmap::DashMap;
 
 use crate::context::{PhpContext, RequestOption};
 use crate::cgi::fastabs::fast_abs;
@@ -40,6 +41,16 @@ pub struct Server {
     pub workers_with_request_matcher: RwLock<Vec<Arc<Worker>>>,
     pub is_registered: AtomicBool,
     pub logger_level: Level,
+    /// Open file cache: path -> (size, mtime, etag)
+    pub file_cache: DashMap<String, CachedFile>,
+}
+
+/// Cached file metadata (nginx open_file_cache equivalent).
+#[derive(Clone, Debug)]
+pub struct CachedFile {
+    pub size: u64,
+    pub mtime: u64,
+    pub etag: String,
 }
 
 impl Server {
@@ -62,6 +73,7 @@ impl Server {
             workers_with_request_matcher: RwLock::new(Vec::new()),
             is_registered: AtomicBool::new(false),
             logger_level: Level::INFO,
+            file_cache: DashMap::new(),
         })
     }
 
@@ -79,6 +91,7 @@ impl Server {
             workers_with_request_matcher: RwLock::new(Vec::new()),
             is_registered: AtomicBool::new(true),
             logger_level: Level::INFO,
+            file_cache: DashMap::new(),
         }
     }
 
@@ -203,6 +216,13 @@ impl Server {
             script_path
         };
 
+        // Serve static files directly (not .php)
+        if let Some(ext) = std::path::Path::new(&script_path).extension() {
+            if ext.to_string_lossy() != "php" {
+                return self.serve_static_file(&script_path).await;
+            }
+        }
+
         // Read request body (drain the stream so hyper doesn't hang)
         let mut body_bytes = Vec::new();
         let mut body = req.into_body();
@@ -222,10 +242,10 @@ impl Server {
         let output = execute_php_cgi(&script_path, &ctx, &body)?;
 
         // Parse CGI output: headers + optional blank line + body
-        let (headers, body_bytes) = parse_cgi_output(&output);
+        let (status_code, headers, body_bytes) = parse_cgi_output(&output);
 
         let mut builder = Response::builder()
-            .status(StatusCode::OK)
+            .status(status_code)
             .header("server", "LarvaPHP");
 
         for (name, value) in &headers {
@@ -276,6 +296,77 @@ impl Server {
         }
 
         None
+    }
+
+    /// Serve a static file directly with nginx-style optimizations:
+    /// file metadata cache, ETag, Last-Modified headers.
+    async fn serve_static_file(&self, path: &str) -> Result<Response<Full<Bytes>>> {
+        // Check file cache first
+        let cached = self.file_cache.get(path);
+
+        let metadata = if let Some(c) = cached {
+            c.clone()
+        } else {
+            let meta = tokio::fs::metadata(path).await.map_err(|e| Error::Io(e))?;
+            let size = meta.len();
+            let mtime = meta
+                .modified()
+                .map_err(|e| Error::Io(e))?
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let etag = format!("\"{:x}-{:x}\"", mtime, size);
+
+            // Insert into cache
+            self.file_cache.insert(path.to_string(), CachedFile { size, mtime, etag: etag.clone() });
+
+            CachedFile { size, mtime, etag }
+        };
+
+        let mime = Self::mime_type(path);
+        let content = tokio::fs::read(path)
+            .await
+            .map_err(|e| Error::Io(e))?;
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", mime)
+            .header("content-length", metadata.size.to_string())
+            .header("last-modified", http_date(metadata.mtime))
+            .header("etag", &metadata.etag)
+            .header("accept-ranges", "bytes")
+            .header("server", "LarvaPHP")
+            .body(Full::new(Bytes::from(content)))
+            .unwrap())
+    }
+
+    /// Determine MIME type from file extension.
+    fn mime_type(path: &str) -> String {
+        match std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+        {
+            "css" => "text/css; charset=UTF-8",
+            "js" => "application/javascript; charset=UTF-8",
+            "json" => "application/json; charset=UTF-8",
+            "html" | "htm" => "text/html; charset=UTF-8",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "svg" => "image/svg+xml",
+            "ico" => "image/x-icon",
+            "woff" => "font/woff",
+            "woff2" => "font/woff2",
+            "ttf" => "font/ttf",
+            "eot" => "application/vnd.ms-fontobject",
+            "pdf" => "application/pdf",
+            "zip" => "application/zip",
+            "xml" => "application/xml; charset=UTF-8",
+            "txt" => "text/plain; charset=UTF-8",
+            _ => "application/octet-stream",
+        }
+        .to_string()
     }
 
     /// Start the HTTP server listening on the given address.
@@ -339,6 +430,37 @@ impl Server {
                                             .unwrap(),
                                     );
                                 };
+
+                                // Serve static files directly (not .php)
+                                if let Some(ext) = std::path::Path::new(&path).extension() {
+                                    if ext.to_string_lossy() != "php" {
+                                        let content = tokio::fs::read(&path)
+                                            .await
+                                            .unwrap_or_default();
+                                        let mime = mime_type_static(&path);
+                                        // Nginx-style headers for static files
+                                        let mut builder = Response::builder()
+                                            .status(StatusCode::OK)
+                                            .header("content-type", mime)
+                                            .header("content-length", content.len().to_string())
+                                            .header("accept-ranges", "bytes")
+                                            .header("server", "LarvaPHP");
+                                        if let Ok(meta) = tokio::fs::metadata(&path).await {
+                                            if let Ok(mt) = meta.modified() {
+                                                if let Ok(since) = mt.duration_since(UNIX_EPOCH) {
+                                                    builder = builder
+                                                        .header("last-modified", http_date(since.as_secs()))
+                                                        .header("etag", format!("\"{:x}-{:x}\"", since.as_secs(), meta.len()));
+                                                }
+                                            }
+                                        }
+                                        return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                            builder
+                                                .body(Full::new(Bytes::from(content)))
+                                                .unwrap(),
+                                        );
+                                    }
+                                }
 
                                 // Build minimal CGI context for environment variables
                                 let rel = path.trim_start_matches(&root);
@@ -418,12 +540,12 @@ impl Server {
 
                                 match execute_php_cgi(&path, &ctx, &body) {
                                     Ok(output) => {
-                                        let (headers, body_bytes) =
+                                        let (status_code, headers, body_bytes) =
                                             parse_cgi_output(&output);
 
                                         let mut builder =
                                             Response::builder()
-                                                .status(StatusCode::OK)
+                                                .status(status_code)
                                                 .header("server", "LarvaPHP");
 
                                         for (name, value) in &headers {
@@ -537,9 +659,10 @@ fn execute_php_cgi(script_path: &str, ctx: &PhpContext, body: &[u8]) -> Result<S
 }
 
 /// Parse CGI output: split headers from body at the first blank line.
-fn parse_cgi_output(output: &str) -> (Vec<(String, String)>, Vec<u8>) {
+fn parse_cgi_output(output: &str) -> (StatusCode, Vec<(String, String)>, Vec<u8>) {
     let mut headers = Vec::new();
     let mut body_start = 0;
+    let mut status_code = StatusCode::OK;
 
     // Find the blank line separating headers from body
     if let Some(pos) = output.find("\r\n\r\n") {
@@ -548,7 +671,18 @@ fn parse_cgi_output(output: &str) -> (Vec<(String, String)>, Vec<u8>) {
 
         for line in header_section.split("\r\n") {
             if let Some((name, value)) = line.split_once(':') {
-                headers.push((name.trim().to_string(), value.trim().to_string()));
+                let name = name.trim();
+                let value = value.trim();
+                if name.eq_ignore_ascii_case("status") {
+                    // Parse CGI Status header: "302 Found" or just "302"
+                    if let Some(code_str) = value.split_whitespace().next() {
+                        if let Ok(code) = code_str.parse::<u16>() {
+                            status_code = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+                        }
+                    }
+                    continue; // Don't add Status: to response headers
+                }
+                headers.push((name.to_string(), value.to_string()));
             }
         }
     } else if let Some(pos) = output.find("\n\n") {
@@ -557,7 +691,17 @@ fn parse_cgi_output(output: &str) -> (Vec<(String, String)>, Vec<u8>) {
 
         for line in header_section.split('\n') {
             if let Some((name, value)) = line.split_once(':') {
-                headers.push((name.trim().to_string(), value.trim().to_string()));
+                let name = name.trim();
+                let value = value.trim();
+                if name.eq_ignore_ascii_case("status") {
+                    if let Some(code_str) = value.split_whitespace().next() {
+                        if let Ok(code) = code_str.parse::<u16>() {
+                            status_code = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+                        }
+                    }
+                    continue;
+                }
+                headers.push((name.to_string(), value.to_string()));
             }
         }
     }
@@ -574,7 +718,7 @@ fn parse_cgi_output(output: &str) -> (Vec<(String, String)>, Vec<u8>) {
         ));
     }
 
-    (headers, body_bytes)
+    (status_code, headers, body_bytes)
 }
 
 /// Resolve the PHP script path from the request URI (static helper).
@@ -621,6 +765,35 @@ fn resolve_index_php_static(uri: &str, root: &str) -> Option<String> {
     None
 }
 
+/// Determine MIME type from file extension (static version for inline handler).
+fn mime_type_static(path: &str) -> String {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+    {
+        "css" => "text/css; charset=UTF-8",
+        "js" => "application/javascript; charset=UTF-8",
+        "json" => "application/json; charset=UTF-8",
+        "html" | "htm" => "text/html; charset=UTF-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "eot" => "application/vnd.ms-fontobject",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "xml" => "application/xml; charset=UTF-8",
+        "txt" => "text/plain; charset=UTF-8",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 /// URL-decode a string.
 fn url_decode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -645,4 +818,75 @@ fn url_decode(s: &str) -> String {
         }
     }
     result
+}
+
+/// Format a Unix timestamp as an HTTP date string (RFC 7231).
+fn http_date(secs: u64) -> String {
+    let dt = match SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs)) {
+        Some(t) => t,
+        None => return String::new(),
+    };
+
+    let (year, month, day, hour, min, sec, wday) = {
+        let mut total_days = dt.duration_since(UNIX_EPOCH).unwrap().as_secs() / 86400;
+        let time_of_day = dt.duration_since(UNIX_EPOCH).unwrap().as_secs() % 86400;
+        let hour = (time_of_day / 3600) as u32;
+        let min = ((time_of_day % 3600) / 60) as u32;
+        let sec = (time_of_day % 60) as u32;
+
+        let mut year = 1970i32;
+        loop {
+            let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+            if total_days < days_in_year as u64 {
+                break;
+            }
+            total_days -= days_in_year as u64;
+            year += 1;
+        }
+
+        let mut month = 0usize;
+        let days_in_month = [
+            31,
+            if is_leap_year(year) { 29 } else { 28 },
+            31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        ];
+        while total_days >= days_in_month[month] as u64 {
+            total_days -= days_in_month[month] as u64;
+            month += 1;
+        }
+        let day = total_days as u32 + 1;
+
+        // Zeller's congruence (0=Saturday, adjust to 0=Sunday)
+        let mut m = month as i32 + 1;
+        let mut y = year;
+        if m < 3 {
+            m += 12;
+            y -= 1;
+        }
+        let k = y % 100;
+        let j = y / 100;
+        let h = (day as i32
+            + (13 * (m + 1)) / 5
+            + k
+            + k / 4
+            + j / 4
+            + 5 * j)
+            % 7;
+        let wday = (h + 6) % 7; // convert: 0=Sat -> 0=Sun
+
+        (year, month as u32 + 1, day, hour, min, sec, wday as u32)
+    };
+
+    const WEEKDAYS: &[&str] = &["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: &[&str] = &["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        WEEKDAYS[wday as usize], day, MONTHS[month as usize - 1], year, hour, min, sec
+    )
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
