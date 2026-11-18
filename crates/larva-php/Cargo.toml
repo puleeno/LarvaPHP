@@ -29,6 +29,7 @@ arc-swap = { workspace = true }
 once_cell = { workspace = true }
 libc = { workspace = true }
 clap = { workspace = true }
+regex = { workspace = true }
 
 [features]
 default = ["mercure", "watcher"]

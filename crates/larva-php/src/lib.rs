@@ -25,6 +25,7 @@
 
 pub mod cgi;
 pub mod cli;
+pub mod config;
 pub mod context;
 pub mod embed;
 pub mod env;
@@ -44,6 +45,10 @@ pub mod mercure;
 #[cfg(feature = "watcher")]
 pub mod watcher;
 
+pub use config::{
+    ConfigLoader, ConfigParser, Middleware, MiddlewareChain, RewriteMiddleware, RewriteRule,
+    ServerConfig, ServerConfigBuilder,
+};
 pub use errors::{Error, Result};
 pub use options::{Option, WorkerOption, ServerOption, RequestOption};
 pub use server::Server;
