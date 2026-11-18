@@ -7,12 +7,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
+use bytes::Bytes;
+use http_body::Body as _;
+use http_body_util::Full;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper::body::Incoming as IncomingBody;
-use http_body_util::Full;
-use bytes::Bytes;
 use hyper_util::server::conn::auto;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
@@ -184,22 +186,53 @@ impl Server {
 
         // Determine the script filename
         let script_path = self.resolve_script_path(ctx.request_uri.as_str())?;
-        if !std::path::Path::new(&script_path).exists() {
-            return Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from("Not Found")))
-                .unwrap());
+
+        // If the resolved path doesn't exist, try index.php (WordPress permalinks)
+        let script_path = if !std::path::Path::new(&script_path).exists() {
+            let alt = self.resolve_index_php(ctx.request_uri.as_str());
+            match alt {
+                Some(ref p) if std::path::Path::new(p).exists() => alt.unwrap(),
+                _ => {
+                    return Ok(Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Full::new(Bytes::from("Not Found")))
+                        .unwrap());
+                }
+            }
+        } else {
+            script_path
+        };
+
+        // Read request body (drain the stream so hyper doesn't hang)
+        let mut body_bytes = Vec::new();
+        let mut body = req.into_body();
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(frame) => {
+                    if let Some(chunk) = frame.data_ref() {
+                        body_bytes.extend_from_slice(chunk);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let body = Bytes::from(body_bytes);
+
+        // Execute the PHP script via CGI and capture output
+        let output = execute_php_cgi(&script_path, &ctx, &body)?;
+
+        // Parse CGI output: headers + optional blank line + body
+        let (headers, body_bytes) = parse_cgi_output(&output);
+
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header("server", "LarvaPHP");
+
+        for (name, value) in &headers {
+            builder = builder.header(name, value);
         }
 
-        // Execute the PHP script and capture output
-        let output = execute_php_script(&script_path)?;
-
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "text/html; charset=UTF-8")
-            .header("server", "LarvaPHP")
-            .body(Full::new(Bytes::from(output)))
-            .unwrap())
+        Ok(builder.body(Full::new(Bytes::from(body_bytes))).unwrap())
     }
 
     /// Resolve the PHP script path from the request URI.
@@ -228,10 +261,25 @@ impl Server {
             full_path.set_extension("php");
         }
 
-Ok(full_path.to_string_lossy().to_string())
+        Ok(full_path.to_string_lossy().to_string())
     }
 
-pub async fn start_server(&self, addr: SocketAddr) -> Result<()> {
+    /// Try resolving index.php for the given URI (WordPress permalink fallback).
+    fn resolve_index_php(&self, uri: &str) -> Option<String> {
+        let path = uri.split('?').next().unwrap_or(uri);
+
+        // Try root index.php first (WordPress front controller)
+        let mut index_path = PathBuf::from(&self.root);
+        index_path.push("index.php");
+        if index_path.exists() {
+            return Some(index_path.to_string_lossy().to_string());
+        }
+
+        None
+    }
+
+    /// Start the HTTP server listening on the given address.
+    pub async fn start_server(&self, addr: SocketAddr) -> Result<()> {
         self.activate();
         info!("LarvaPHP server listening on http://{}", addr);
 
@@ -254,54 +302,169 @@ pub async fn start_server(&self, addr: SocketAddr) -> Result<()> {
                     .serve_connection(
                         io,
                         service_fn(move |req: Request<IncomingBody>| {
-                        let root = root.clone();
-                        let split_path = split_path.clone();
-                        let registered = registered.clone();
-                        async move {
-                            if !registered {
-                                return Ok::<Response<Full<Bytes>>, hyper::Error>(Response::builder()
-                                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                                    .body(Full::new(Bytes::from("Service Unavailable")))
-                                    .unwrap());
-                            }
+                            let root = root.clone();
+                            let split_path = split_path.clone();
+                            let registered = registered.clone();
+                            async move {
+                                if !registered {
+                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                        Response::builder()
+                                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                                            .body(Full::new(Bytes::from("Service Unavailable")))
+                                            .unwrap(),
+                                    );
+                                }
 
-                            let uri = req.uri().to_string();
-                            let script_path = resolve_script_path_static(&uri, &root, &split_path);
+                                let uri = req.uri().to_string();
+                                let script_path =
+                                    resolve_script_path_static(&uri, &root, &split_path);
 
-                            if let Some(path) = script_path {
-                                if std::path::Path::new(&path).exists() {
-                                    let body = execute_php_script(&path).unwrap_or_default();
+                                // If the resolved path doesn't exist, try index.php
+                                let script_path =
+                                    if let Some(ref p) = script_path {
+                                        if std::path::Path::new(p).exists() {
+                                            script_path
+                                        } else {
+                                            resolve_index_php_static(&uri, &root)
+                                        }
+                                    } else {
+                                        resolve_index_php_static(&uri, &root)
+                                    };
 
-                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(Response::builder()
-                                        .status(StatusCode::OK)
-                                        .header("content-type", "text/html; charset=UTF-8")
-                                        .header("server", "LarvaPHP")
-                                        .body(Full::new(Bytes::from(body)))
-                                        .unwrap());
+                                let Some(path) = script_path else {
+                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                        Response::builder()
+                                            .status(StatusCode::NOT_FOUND)
+                                            .body(Full::new(Bytes::from("Not Found")))
+                                            .unwrap(),
+                                    );
+                                };
+
+                                // Build minimal CGI context for environment variables
+                                let rel = path.trim_start_matches(&root);
+                                let rel = rel.trim_start_matches('\\').trim_start_matches('/');
+                                let script_name = if rel.is_empty() {
+                                    "/".to_string()
+                                } else {
+                                    format!("/{}", rel.replace('\\', "/"))
+                                };
+
+                                let ctx = PhpContext {
+                                    ctx: tokio::sync::watch::channel(None).1,
+                                    document_root: root.clone(),
+                                    split_path: split_path.clone(),
+                                    env: Default::default(),
+                                    logger: Level::INFO,
+                                    worker: None,
+                                    server: Arc::new(Server::fallback()),
+                                    request_body_timeout: None,
+                                    doc_uri: String::new(),
+                                    path_info: String::new(),
+                                    script_name,
+                                    script_filename: path.clone(),
+                                    request_uri: uri.clone(),
+                                    query_string: uri
+                                        .split_once('?')
+                                        .map(|(_, q)| q.to_string())
+                                        .unwrap_or_default(),
+                                    request_method: req.method().to_string(),
+                                    content_type: req
+                                        .headers()
+                                        .get("content-type")
+                                        .and_then(|v| v.to_str().ok())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    content_length: req
+                                        .headers()
+                                        .get("content-length")
+                                        .and_then(|v| v.to_str().ok())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    server_protocol: "HTTP/1.1".to_string(),
+                                    server_name: req
+                                        .headers()
+                                        .get("host")
+                                        .and_then(|v| v.to_str().ok())
+                                        .and_then(|v| v.split_once(':').map(|(h, _)| h.to_string()))
+                                        .unwrap_or_else(|| "localhost".to_string()),
+                                    server_port: req
+                                        .headers()
+                                        .get("host")
+                                        .and_then(|v| v.to_str().ok())
+                                        .and_then(|v| v.split_once(':').map(|(_, p)| p.to_string()))
+                                        .unwrap_or_else(|| "80".to_string()),
+                                    https: "off".to_string(),
+                                    headers_written: false,
+                                    is_done: AtomicBool::new(false),
+                                    client_had_closed: AtomicBool::new(false),
+                                    started_at: Instant::now(),
+                                    handler_return: None,
+                                };
+
+                                // Read request body (drain the stream so hyper doesn't hang)
+                                let mut body_bytes = Vec::new();
+                                let mut body = req.into_body();
+                                while let Some(frame) = body.frame().await {
+                                    match frame {
+                                        Ok(frame) => {
+                                            if let Some(chunk) = frame.data_ref() {
+                                                body_bytes.extend_from_slice(chunk);
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                                let body = Bytes::from(body_bytes);
+
+                                match execute_php_cgi(&path, &ctx, &body) {
+                                    Ok(output) => {
+                                        let (headers, body_bytes) =
+                                            parse_cgi_output(&output);
+
+                                        let mut builder =
+                                            Response::builder()
+                                                .status(StatusCode::OK)
+                                                .header("server", "LarvaPHP");
+
+                                        for (name, value) in &headers {
+                                            builder = builder.header(name, value);
+                                        }
+
+                                        Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                            builder
+                                                .body(Full::new(Bytes::from(body_bytes)))
+                                                .unwrap(),
+                                        )
+                                    }
+                                    Err(e) => {
+                                        error!("PHP execution error: {}", e);
+                                        Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                            Response::builder()
+                                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                .body(Full::new(Bytes::from(
+                                                    "Internal Server Error",
+                                                )))
+                                                .unwrap(),
+                                        )
+                                    }
                                 }
                             }
-
-                            Ok::<Response<Full<Bytes>>, hyper::Error>(Response::builder()
-                                .status(StatusCode::NOT_FOUND)
-                                .body(Full::new(Bytes::from("Not Found")))
-                                .unwrap())
-                        }
-                    }))
-                    .await
-                {
-                    error!("Connection error: {}", err);
-                }
-            });
+                        }))
+                        .await
+                    {
+                        error!("Connection error: {}", err);
+                    }
+                });
         }
     }
 }
 
-/// Find the php.exe executable.
-fn find_php_exe() -> Option<String> {
+/// Find the php-cgi.exe executable.
+fn find_php_cgi() -> Option<String> {
     let candidates = [
-        r"C:\Program Files\PHP\current\php.exe",
-        r"C:\Program Files (x86)\PHP\current\php.exe",
-        r"C:\php\php.exe",
+        r"C:\Program Files\PHP\current\php-cgi.exe",
+        r"C:\Program Files (x86)\PHP\current\php-cgi.exe",
+        r"C:\php\php-cgi.exe",
     ];
     for c in &candidates {
         if std::path::Path::new(c).exists() {
@@ -310,7 +473,7 @@ fn find_php_exe() -> Option<String> {
     }
     if let Ok(path) = std::env::var("PATH") {
         for dir in path.split(';') {
-            let p = std::path::Path::new(dir).join("php.exe");
+            let p = std::path::Path::new(dir).join("php-cgi.exe");
             if p.exists() {
                 return Some(p.to_string_lossy().to_string());
             }
@@ -319,19 +482,102 @@ fn find_php_exe() -> Option<String> {
     None
 }
 
-/// Execute a PHP script via php.exe subprocess and capture stdout.
-fn execute_php_script(script_path: &str) -> Result<String> {
-    let php_exe = find_php_exe()
-        .ok_or_else(|| Error::Ffi("php.exe not found".to_string()))?;
+/// Execute a PHP script via php-cgi.exe CGI subprocess and capture output.
+fn execute_php_cgi(script_path: &str, ctx: &PhpContext, body: &[u8]) -> Result<String> {
+    let php_exe = find_php_cgi()
+        .ok_or_else(|| Error::Ffi("php-cgi.exe not found".to_string()))?;
 
-    let output = std::process::Command::new(php_exe)
-        .arg(script_path)
-        .output()
-        .map_err(|e| Error::Ffi(format!("Failed to execute php: {}", e)))?;
+    let mut cmd = std::process::Command::new(php_exe);
+    cmd.current_dir(
+        std::path::Path::new(script_path)
+            .parent()
+            .unwrap_or(std::path::Path::new(".")),
+    );
+
+    // Set CGI environment variables
+    cmd.env("REQUEST_METHOD", &ctx.request_method);
+    cmd.env("REQUEST_URI", &ctx.request_uri);
+    cmd.env("QUERY_STRING", &ctx.query_string);
+    cmd.env("SCRIPT_NAME", &ctx.script_name);
+    cmd.env("SCRIPT_FILENAME", script_path);
+    cmd.env("DOCUMENT_ROOT", &ctx.document_root);
+    cmd.env("SERVER_PROTOCOL", &ctx.server_protocol);
+    cmd.env("SERVER_NAME", &ctx.server_name);
+    cmd.env("SERVER_PORT", &ctx.server_port);
+    cmd.env("HTTPS", &ctx.https);
+    cmd.env("CONTENT_TYPE", &ctx.content_type);
+    cmd.env("CONTENT_LENGTH", &ctx.content_length);
+    cmd.env("PATH_INFO", &ctx.path_info);
+    cmd.env("PHP_SELF", &ctx.script_name);
+    cmd.env("REDIRECT_STATUS", "200");
+    cmd.env("GATEWAY_INTERFACE", "CGI/1.1");
+    cmd.env("SERVER_SOFTWARE", "LarvaPHP/1.0");
+
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Error::Ffi(format!("Failed to spawn php-cgi: {}", e)))?;
+
+    // Write request body to stdin
+    if !body.is_empty() {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(body);
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| Error::Ffi(format!("Failed to wait for php-cgi: {}", e)))?;
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Parse CGI output: split headers from body at the first blank line.
+fn parse_cgi_output(output: &str) -> (Vec<(String, String)>, Vec<u8>) {
+    let mut headers = Vec::new();
+    let mut body_start = 0;
+
+    // Find the blank line separating headers from body
+    if let Some(pos) = output.find("\r\n\r\n") {
+        let header_section = &output[..pos];
+        body_start = pos + 4;
+
+        for line in header_section.split("\r\n") {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.push((name.trim().to_string(), value.trim().to_string()));
+            }
+        }
+    } else if let Some(pos) = output.find("\n\n") {
+        let header_section = &output[..pos];
+        body_start = pos + 2;
+
+        for line in header_section.split('\n') {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.push((name.trim().to_string(), value.trim().to_string()));
+            }
+        }
+    }
+
+    let body_bytes = output[body_start..].as_bytes().to_vec();
+
+    // Ensure content-type header exists
+    let has_content_type =
+        headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("content-type"));
+    if !has_content_type {
+        headers.push((
+            "content-type".to_string(),
+            "text/html; charset=UTF-8".to_string(),
+        ));
+    }
+
+    (headers, body_bytes)
+}
+
+/// Resolve the PHP script path from the request URI (static helper).
 fn resolve_script_path_static(uri: &str, root: &str, split_path: &[String]) -> Option<String> {
     let path = uri.split('?').next().unwrap_or(uri);
     let decoded = url_decode(path);
@@ -359,6 +605,20 @@ fn resolve_script_path_static(uri: &str, root: &str, split_path: &[String]) -> O
     }
 
     Some(full_path.to_string_lossy().to_string())
+}
+
+/// Try resolving index.php for the given URI (WordPress permalink fallback).
+fn resolve_index_php_static(uri: &str, root: &str) -> Option<String> {
+    let _path = uri.split('?').next().unwrap_or(uri);
+
+    // Try root index.php first (WordPress front controller)
+    let mut index_path = PathBuf::from(root);
+    index_path.push("index.php");
+    if index_path.exists() {
+        return Some(index_path.to_string_lossy().to_string());
+    }
+
+    None
 }
 
 /// URL-decode a string.
