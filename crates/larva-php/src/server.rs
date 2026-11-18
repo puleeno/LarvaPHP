@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
@@ -246,7 +246,9 @@ impl Server {
 
         let mut builder = Response::builder()
             .status(status_code)
-            .header("server", "LarvaPHP");
+            .header("server", "LarvaPHP")
+            .header("x-content-type-options", "nosniff")
+            .header("x-frame-options", "DENY");
 
         for (name, value) in &headers {
             builder = builder.header(name, value);
@@ -263,6 +265,11 @@ impl Server {
         // URL-decode the path
         let decoded = url_decode(path);
 
+        // Reject null bytes
+        if decoded.contains('\0') {
+            return Err(Error::Ffi("Null byte in path".to_string()));
+        }
+
         // Build the full path: root + path
         let mut full_path = PathBuf::from(&self.root);
         if decoded.starts_with('/') {
@@ -271,17 +278,31 @@ impl Server {
             full_path.push(&decoded);
         }
 
-        // If it's a directory, look for index.php
-        if full_path.is_dir() {
-            full_path.push("index.php");
+        // Sanitize path traversal (.. segments)
+        let sanitized = sanitize_path(&full_path)?;
+
+        // Verify the resolved path is within the document root
+        if !sanitized.starts_with(&self.root) {
+            return Err(Error::Ffi("Path traversal detected".to_string()));
         }
+
+        // If it's a directory, look for index.php
+        let sanitized = if sanitized.is_dir() {
+            sanitized.join("index.php")
+        } else {
+            sanitized
+        };
 
         // If no .php extension, add one
-        if full_path.extension().is_none() {
-            full_path.set_extension("php");
-        }
+        let sanitized = if sanitized.extension().is_none() {
+            let mut p = sanitized.clone();
+            p.set_extension("php");
+            p
+        } else {
+            sanitized
+        };
 
-        Ok(full_path.to_string_lossy().to_string())
+        Ok(sanitized.to_string_lossy().to_string())
     }
 
     /// Try resolving index.php for the given URI (WordPress permalink fallback).
@@ -301,6 +322,11 @@ impl Server {
     /// Serve a static file directly with nginx-style optimizations:
     /// file metadata cache, ETag, Last-Modified headers.
     async fn serve_static_file(&self, path: &str) -> Result<Response<Full<Bytes>>> {
+        // Block sensitive files from being served
+        if is_sensitive_file(path) {
+            return Err(Error::Ffi("Forbidden".to_string()));
+        }
+
         // Check file cache first
         let cached = self.file_cache.get(path);
 
@@ -335,6 +361,8 @@ impl Server {
             .header("last-modified", http_date(metadata.mtime))
             .header("etag", &metadata.etag)
             .header("accept-ranges", "bytes")
+            .header("x-content-type-options", "nosniff")
+            .header("x-frame-options", "DENY")
             .header("server", "LarvaPHP")
             .body(Full::new(Bytes::from(content)))
             .unwrap())
@@ -434,6 +462,18 @@ impl Server {
                                 // Serve static files directly (not .php)
                                 if let Some(ext) = std::path::Path::new(&path).extension() {
                                     if ext.to_string_lossy() != "php" {
+                                        // Block sensitive files
+                                        if is_sensitive_file(&path) {
+                                            return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                                Response::builder()
+                                                    .status(StatusCode::FORBIDDEN)
+                                                    .header("content-type", "text/plain; charset=UTF-8")
+                                                    .header("server", "LarvaPHP")
+                                                    .body(Full::new(Bytes::from("Forbidden")))
+                                                    .unwrap(),
+                                            );
+                                        }
+
                                         let content = tokio::fs::read(&path)
                                             .await
                                             .unwrap_or_default();
@@ -444,6 +484,8 @@ impl Server {
                                             .header("content-type", mime)
                                             .header("content-length", content.len().to_string())
                                             .header("accept-ranges", "bytes")
+                                            .header("x-content-type-options", "nosniff")
+                                            .header("x-frame-options", "DENY")
                                             .header("server", "LarvaPHP");
                                         if let Ok(meta) = tokio::fs::metadata(&path).await {
                                             if let Ok(mt) = meta.modified() {
@@ -546,7 +588,9 @@ impl Server {
                                         let mut builder =
                                             Response::builder()
                                                 .status(status_code)
-                                                .header("server", "LarvaPHP");
+                                                .header("server", "LarvaPHP")
+                                                .header("x-content-type-options", "nosniff")
+                                                .header("x-frame-options", "DENY");
 
                                         for (name, value) in &headers {
                                             builder = builder.header(name, value);
@@ -726,6 +770,12 @@ fn resolve_script_path_static(uri: &str, root: &str, split_path: &[String]) -> O
     let path = uri.split('?').next().unwrap_or(uri);
     let decoded = url_decode(path);
 
+    // Reject null bytes
+    if decoded.contains('\0') {
+        return None;
+    }
+
+    // Build the full path: root + path
     let mut full_path = PathBuf::from(root);
     if decoded.starts_with('/') {
         full_path.push(&decoded[1..]);
@@ -733,29 +783,44 @@ fn resolve_script_path_static(uri: &str, root: &str, split_path: &[String]) -> O
         full_path.push(&decoded);
     }
 
-    if full_path.is_dir() {
-        full_path.push("index.php");
+    // Sanitize path traversal (.. segments)
+    let sanitized = match sanitize_path(&full_path) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+
+    // Verify the resolved path is within the document root
+    if !sanitized.starts_with(root) {
+        return None;
     }
 
-    if full_path.extension().is_none() {
+    if sanitized.is_dir() {
+        let index_path = sanitized.join("index.php");
+        if index_path.exists() {
+            return Some(index_path.to_string_lossy().to_string());
+        }
+        return None;
+    }
+
+    if sanitized.extension().is_none() {
         for ext in split_path {
-            let mut p = full_path.clone();
+            let mut p = sanitized.clone();
             p.set_extension(ext.trim_start_matches('.'));
             if p.exists() {
                 return Some(p.to_string_lossy().to_string());
             }
         }
-        full_path.set_extension("php");
+        let mut p = sanitized.clone();
+        p.set_extension("php");
+        return Some(p.to_string_lossy().to_string());
     }
 
-    Some(full_path.to_string_lossy().to_string())
+    Some(sanitized.to_string_lossy().to_string())
 }
 
 /// Try resolving index.php for the given URI (WordPress permalink fallback).
 fn resolve_index_php_static(uri: &str, root: &str) -> Option<String> {
     let _path = uri.split('?').next().unwrap_or(uri);
-
-    // Try root index.php first (WordPress front controller)
     let mut index_path = PathBuf::from(root);
     index_path.push("index.php");
     if index_path.exists() {
@@ -889,4 +954,95 @@ fn http_date(secs: u64) -> String {
 
 fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Sanitize a path by resolving `..` and `.` segments to prevent directory traversal.
+/// Returns the canonicalized absolute path if it stays within bounds, or an error.
+fn sanitize_path(path: &PathBuf) -> Result<PathBuf> {
+    let mut components: Vec<&std::ffi::OsStr> = Vec::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if !components.is_empty() {
+                    components.pop();
+                }
+                // If components is empty, we've gone above root - reject
+                else {
+                    return Err(Error::Ffi("Path traversal above root".to_string()));
+                }
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(c) => components.push(c),
+            std::path::Component::RootDir => {}
+            std::path::Component::Prefix(_) => components.push(component.as_os_str()),
+        }
+    }
+
+    if components.is_empty() {
+        return Err(Error::Ffi("Empty path after sanitization".to_string()));
+    }
+
+    let mut result = PathBuf::new();
+    for c in &components {
+        result.push(c);
+    }
+
+    Ok(result)
+}
+
+/// Check if a file path is sensitive and should not be served directly.
+/// Blocks: .htaccess, .htpasswd, wp-config.php, .env, .git/*, composer.lock,
+/// vendor/*, storage/*, node_modules/*, *.sql, *.bak, *.log, *.orig
+fn is_sensitive_file(path: &str) -> bool {
+    let p = Path::new(path);
+    let file_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let file_name_lower = file_name.to_lowercase();
+
+    // Hidden files starting with dot
+    if file_name.starts_with('.') {
+        return true;
+    }
+
+    // Specific sensitive filenames
+    let sensitive_names = [
+        "wp-config.php",
+        "wp-config-sample.php",
+        ".env",
+        ".env.example",
+        ".env.local",
+        "composer.lock",
+        "composer.json",
+        "package-lock.json",
+        "package.json",
+        "makefile",
+        "dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "vagrantfile",
+    ];
+    if sensitive_names.iter().any(|&n| file_name_lower == n) {
+        return true;
+    }
+
+    // Sensitive extensions
+    let sensitive_exts = [
+        ".sql", ".bak", ".backup", ".old", ".orig", ".tmp", ".temp",
+        ".log", ".swp", ".swo", "~", ".ds_store",
+    ];
+    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+        let ext_lower = format!(".{}", ext.to_lowercase());
+        if sensitive_exts.iter().any(|&e| ext_lower == e) {
+            return true;
+        }
+    }
+
+    // Block .git/, .svn/, .hg/ directories anywhere in path
+    let path_str = path.to_lowercase();
+    let vcs_dirs = [".git/", ".svn/", ".hg/", ".bzr/"];
+    if vcs_dirs.iter().any(|d| path_str.contains(d)) {
+        return true;
+    }
+
+    false
 }
