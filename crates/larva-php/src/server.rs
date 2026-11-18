@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
-
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_body_util::Full;
@@ -43,6 +42,10 @@ pub struct Server {
     pub logger_level: Level,
     /// Open file cache: path -> (size, mtime, etag)
     pub file_cache: DashMap<String, CachedFile>,
+    /// Rate limiter (per-IP)
+    pub rate_limiter: RateLimiter,
+    /// Max request body size in bytes (default: 10 MB)
+    pub max_body_size: u64,
 }
 
 /// Cached file metadata (nginx open_file_cache equivalent).
@@ -51,6 +54,75 @@ pub struct CachedFile {
     pub size: u64,
     pub mtime: u64,
     pub etag: String,
+}
+
+/// Rate limiter configuration.
+#[derive(Clone, Debug)]
+pub struct RateLimitConfig {
+    /// Max requests per window per IP
+    pub max_requests: u64,
+    /// Window duration in seconds
+    pub window_secs: u64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_requests: 60,
+            window_secs: 60,
+        }
+    }
+}
+
+/// Per-IP rate limiter state.
+#[derive(Clone, Debug)]
+struct RateLimitEntry {
+    count: u64,
+    window_start: u64,
+}
+
+/// Thread-safe rate limiter using a fixed-window counter per IP.
+#[derive(Debug, Clone)]
+pub struct RateLimiter {
+    entries: Arc<DashMap<String, RateLimitEntry>>,
+    config: RateLimitConfig,
+}
+
+impl RateLimiter {
+    pub fn new(config: RateLimitConfig) -> Self {
+        Self {
+            entries: Arc::new(DashMap::new()),
+            config,
+        }
+    }
+
+    /// Check if the request from the given IP is allowed.
+    /// Returns true if allowed, false if rate limit exceeded.
+    pub fn check(&self, ip: &str) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let mut entry = self.entries.entry(ip.to_string()).or_insert(RateLimitEntry {
+            count: 0,
+            window_start: now,
+        });
+
+        // Reset window if expired
+        if now - entry.window_start >= self.config.window_secs {
+            entry.count = 1;
+            entry.window_start = now;
+            return true;
+        }
+
+        if entry.count >= self.config.max_requests {
+            return false;
+        }
+
+        entry.count += 1;
+        true
+    }
 }
 
 impl Server {
@@ -74,6 +146,8 @@ impl Server {
             is_registered: AtomicBool::new(false),
             logger_level: Level::INFO,
             file_cache: DashMap::new(),
+            rate_limiter: RateLimiter::new(RateLimitConfig::default()),
+            max_body_size: 10 * 1024 * 1024, // 10 MB
         })
     }
 
@@ -92,6 +166,8 @@ impl Server {
             is_registered: AtomicBool::new(true),
             logger_level: Level::INFO,
             file_cache: DashMap::new(),
+            rate_limiter: RateLimiter::new(RateLimitConfig::default()),
+            max_body_size: 10 * 1024 * 1024, // 10 MB
         }
     }
 
@@ -410,10 +486,13 @@ impl Server {
 
         loop {
             let (stream, _) = listener.accept().await.map_err(|e| Error::Io(e))?;
+            let peer_addr = stream.peer_addr().map_err(|e| Error::Io(e))?;
 
             let root = server_root.clone();
             let split_path = server_split_path.clone();
             let registered = self.is_registered.load(Ordering::Acquire);
+            let rate_limiter = self.rate_limiter.clone();
+            let max_body_size = self.max_body_size;
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
@@ -424,12 +503,32 @@ impl Server {
                             let root = root.clone();
                             let split_path = split_path.clone();
                             let registered = registered.clone();
+                            let rate_limiter = rate_limiter.clone();
+                            let max_body_size = max_body_size;
+                            let client_ip = peer_addr.ip().to_string();
                             async move {
                                 if !registered {
                                     return Ok::<Response<Full<Bytes>>, hyper::Error>(
                                         Response::builder()
                                             .status(StatusCode::SERVICE_UNAVAILABLE)
                                             .body(Full::new(Bytes::from("Service Unavailable")))
+                                            .unwrap(),
+                                    );
+                                }
+
+                                // Rate limiting check
+                                let allowed = rate_limiter.check(&client_ip);
+                                if !allowed {
+                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                        Response::builder()
+                                            .status(StatusCode::TOO_MANY_REQUESTS)
+                                            .header("content-type", "text/plain; charset=UTF-8")
+                                            .header(
+                                                "retry-after",
+                                                rate_limiter.config.window_secs.to_string(),
+                                            )
+                                            .header("server", "LarvaPHP")
+                                            .body(Full::new(Bytes::from("Too Many Requests")))
                                             .unwrap(),
                                     );
                                 }
@@ -572,6 +671,25 @@ impl Server {
                                     match frame {
                                         Ok(frame) => {
                                             if let Some(chunk) = frame.data_ref() {
+                                                if body_bytes.len() + chunk.len()
+                                                    > max_body_size as usize
+                                                {
+                                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                                        Response::builder()
+                                                            .status(
+                                                                StatusCode::PAYLOAD_TOO_LARGE,
+                                                            )
+                                                            .header(
+                                                                "content-type",
+                                                                "text/plain; charset=UTF-8",
+                                                            )
+                                                            .header("server", "LarvaPHP")
+                                                            .body(Full::new(Bytes::from(
+                                                                "Payload Too Large",
+                                                            )))
+                                                            .unwrap(),
+                                                    );
+                                                }
                                                 body_bytes.extend_from_slice(chunk);
                                             }
                                         }
