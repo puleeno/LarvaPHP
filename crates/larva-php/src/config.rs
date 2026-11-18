@@ -273,6 +273,17 @@ pub struct ConfigLoader {
     parsers: HashMap<String, Box<dyn ConfigParser>>,
 }
 
+impl Clone for ConfigLoader {
+    fn clone(&self) -> Self {
+        let mut parsers: HashMap<String, Box<dyn ConfigParser>> = HashMap::new();
+        parsers.insert("cli".to_string(), Box::new(CliParser));
+        parsers.insert("apache".to_string(), Box::new(ApacheParser));
+        parsers.insert("nginx".to_string(), Box::new(NginxParser));
+        parsers.insert("caddy".to_string(), Box::new(CaddyParser));
+        Self { parsers }
+    }
+}
+
 impl ConfigLoader {
     pub fn new() -> Self {
         let mut parsers: HashMap<String, Box<dyn ConfigParser>> = HashMap::new();
@@ -848,5 +859,284 @@ RewriteRule ^/legacy/(.+)$ /current/$1
         assert_eq!(config.rate_limit.max_requests, 60);
         assert_eq!(config.max_body_size, 10 * 1024 * 1024);
         assert!(config.middleware.is_empty());
+    }
+}
+
+// ============================================================================
+// Hot Reload Manager
+// ============================================================================
+
+#[cfg(feature = "watcher")]
+pub mod hot_reload {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+
+    /// Manages hot-reloading of configuration and PHP source files.
+    ///
+    /// Uses `ArcSwap` for lock-free config reads and `notify` for file watching.
+    /// When a watched file changes, the config is re-parsed and atomically swapped.
+    pub struct HotReloadManager {
+        /// Watcher event sender (to forward notify events).
+        tx: Option<tokio::sync::mpsc::UnboundedSender<notify::Event>>,
+        /// Shutdown flag for the watcher task.
+        shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+        /// Config format used for re-parsing.
+        format: String,
+        /// Config source string (for re-parse on change).
+        source: std::sync::RwLock<String>,
+        /// Loader instance.
+        loader: ConfigLoader,
+        /// Watched directories.
+        watched_dirs: std::sync::RwLock<Vec<PathBuf>>,
+    }
+
+    impl HotReloadManager {
+        pub fn new(format: &str, source: &str, loader: ConfigLoader) -> Self {
+            Self {
+                tx: None,
+                shutdown: None,
+                format: format.to_string(),
+                source: std::sync::RwLock::new(source.to_string()),
+                loader,
+                watched_dirs: std::sync::RwLock::new(Vec::new()),
+            }
+        }
+
+        /// Start the hot reload watcher.
+        pub fn start(&mut self) -> std::result::Result<(), String> {
+            let (tx, shutdown) = crate::watcher::start_watcher_task();
+            self.tx = Some(tx);
+            self.shutdown = Some(shutdown);
+
+            // Register a pattern group that re-parses config on change.
+            let loader_clone = self.loader.clone();
+            let format_clone = self.format.clone();
+            let source_clone = Arc::new(std::sync::RwLock::new(self.source.read().unwrap().clone()));
+
+            let callback = move |events: &[crate::watcher::FileEvent]| {
+                // Check if any changed file is a config file or PHP source
+                let should_reload = events.iter().any(|e| {
+                    let path = std::path::Path::new(&e.path);
+                    path.extension().map_or(false, |ext| {
+                        matches!(ext.to_string_lossy().as_ref(), "php" | "htaccess" | "conf" | "yaml" | "yml" | "json" | "toml")
+                    })
+                });
+
+                if should_reload {
+                    let src = source_clone.read().unwrap().clone();
+                    match loader_clone.parse(&format_clone, &src) {
+                        Ok(new_config) => {
+                            let arc = Arc::new(new_config);
+                            crate::watcher::WATCHER.read().unwrap().set_config(Some(Arc::clone(&arc)));
+                            super::register_config("hot-reloaded", arc);
+                            tracing::info!("Hot reload: config updated from file change");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Hot reload: failed to re-parse config: {}", e);
+                        }
+                    }
+
+                    // Invalidate file cache for changed PHP files
+                    for e in events {
+                        if std::path::Path::new(&e.path).extension().map_or(false, |ext| ext == "php") {
+                            tracing::debug!("Hot reload: PHP file changed: {}", e.path);
+                        }
+                    }
+                }
+            };
+
+            let group = Arc::new(crate::watcher::PatternGroup::new(
+                vec![self.format.clone()],
+                Box::new(callback),
+            ));
+
+            // Watch the current directory and root
+            let dirs: Vec<PathBuf> = self.watched_dirs.read().unwrap().clone();
+            let watch_dirs = if dirs.is_empty() {
+                vec![std::env::current_dir().unwrap_or_default()]
+            } else {
+                dirs
+            };
+
+            let tx = self.tx.as_ref().unwrap().clone();
+            for dir in &watch_dirs {
+                if let Err(e) = crate::watcher::watch_directory(&tx, dir) {
+                    tracing::warn!("Hot reload: failed to watch {}: {}", dir.display(), e);
+                } else {
+                    crate::watcher::WATCHER.read().unwrap().register_pattern(dir.clone(), group.clone());
+                    self.watched_dirs.write().unwrap().push(dir.clone());
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Update the config source and trigger a re-parse.
+        pub fn update_source(&self, source: &str) -> std::result::Result<(), String> {
+            *self.source.write().unwrap() = source.to_string();
+            let config = self.loader.parse(&self.format, source).map_err(|e| e.to_string())?;
+            let arc = Arc::new(config);
+            crate::watcher::WATCHER.read().unwrap().set_config(Some(Arc::clone(&arc)));
+            super::register_config("hot-reloaded", arc);
+            Ok(())
+        }
+
+        /// Get the current hot-swapped config.
+        pub fn current_config(&self) -> Option<Arc<super::ServerConfig>> {
+            let guard = crate::watcher::WATCHER.read().unwrap();
+            let config_arc = guard.get_config();
+            (*config_arc).clone()
+        }
+
+        /// Add a directory to watch for changes.
+        pub fn watch_dir(&mut self, dir: PathBuf) {
+            self.watched_dirs.write().unwrap().push(dir);
+        }
+
+        /// Shutdown the hot reload watcher.
+        pub fn shutdown(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                shutdown.store(true, Ordering::Release);
+            }
+            if let Some(tx) = self.tx.take() {
+                drop(tx);
+            }
+        }
+    }
+
+    impl Default for HotReloadManager {
+        fn default() -> Self {
+            Self::new("cli", ".", ConfigLoader::default())
+        }
+    }
+
+    impl Drop for HotReloadManager {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+}
+
+// Non-watcher stub
+#[cfg(not(feature = "watcher"))]
+pub mod hot_reload {
+    use super::*;
+
+    pub struct HotReloadManager {
+        _format: String,
+        _source: std::sync::RwLock<String>,
+        _loader: ConfigLoader,
+    }
+
+    impl HotReloadManager {
+        pub fn new(format: &str, source: &str, _loader: ConfigLoader) -> Self {
+            Self {
+                _format: format.to_string(),
+                _source: std::sync::RwLock::new(source.to_string()),
+                _loader: ConfigLoader::default(),
+            }
+        }
+
+        pub fn start(&mut self) -> std::result::Result<(), String> {
+            Err("watcher support is not enabled".to_string())
+        }
+
+        pub fn update_source(&self, _source: &str) -> std::result::Result<(), String> {
+            Err("watcher support is not enabled".to_string())
+        }
+
+        pub fn current_config(&self) -> Option<Arc<super::ServerConfig>> {
+            None
+        }
+
+        pub fn watch_dir(&mut self, _dir: std::path::PathBuf) {}
+
+        pub fn shutdown(&mut self) {}
+    }
+
+    impl Default for HotReloadManager {
+        fn default() -> Self {
+            Self::new("cli", ".", ConfigLoader::default())
+        }
+    }
+
+    impl Drop for HotReloadManager {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+}
+
+#[cfg(test)]
+mod hot_reload_tests {
+    use super::hot_reload::HotReloadManager;
+    use super::*;
+
+    #[test]
+    fn hot_reload_manager_default() {
+        let mgr = HotReloadManager::default();
+        assert!(mgr.current_config().is_none());
+    }
+
+    #[test]
+    fn hot_reload_manager_new() {
+        let loader = ConfigLoader::default();
+        let mgr = HotReloadManager::new("cli", ".", loader.clone());
+        assert!(mgr.current_config().is_none());
+    }
+
+    #[test]
+    fn hot_reload_manager_watch_dir() {
+        let mut mgr = HotReloadManager::default();
+        mgr.watch_dir(PathBuf::from("/tmp/test"));
+    }
+
+    #[test]
+    fn hot_reload_manager_shutdown() {
+        let mut mgr = HotReloadManager::default();
+        mgr.shutdown();
+    }
+
+    #[cfg(not(feature = "watcher"))]
+    #[test]
+    fn hot_reload_manager_current_config_none() {
+        let mgr = HotReloadManager::default();
+        assert!(mgr.current_config().is_none());
+    }
+
+    #[cfg(not(feature = "watcher"))]
+    #[test]
+    fn hot_reload_manager_start_without_watcher() {
+        let mut mgr = HotReloadManager::default();
+        let result = mgr.start();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "watcher support is not enabled");
+    }
+
+    #[cfg(not(feature = "watcher"))]
+    #[test]
+    fn hot_reload_manager_update_source_without_watcher() {
+        let mgr = HotReloadManager::default();
+        let result = mgr.update_source("DocumentRoot /var/www");
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "watcher")]
+    #[tokio::test]
+    async fn hot_reload_manager_start_with_watcher() {
+        let mut mgr = HotReloadManager::default();
+        let result = mgr.start();
+        assert!(result.is_ok());
+        mgr.shutdown();
+    }
+
+    #[cfg(feature = "watcher")]
+    #[test]
+    fn hot_reload_manager_update_source_with_watcher() {
+        let mgr = HotReloadManager::default();
+        let result = mgr.update_source("DocumentRoot /var/www");
+        assert!(result.is_ok());
+        assert!(mgr.current_config().is_some());
     }
 }
