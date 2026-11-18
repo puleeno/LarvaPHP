@@ -120,3 +120,68 @@ pub fn set_metrics(metrics: Box<dyn Metrics + Send + Sync>) {
 pub(crate) fn metrics() -> impl std::ops::Deref<Target = Box<dyn Metrics + Send + Sync>> {
     METRICS.read().unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn null_metrics_is_noop() {
+        let metrics = NullMetrics;
+        metrics.start_worker("test");
+        metrics.ready_worker("test");
+        metrics.stop_worker("test", StopReason::Crash);
+        metrics.total_workers("test", 5);
+        metrics.total_threads(10);
+        metrics.start_request();
+        metrics.stop_request();
+    }
+
+    #[test]
+    fn atomic_metrics_thread_count() {
+        let metrics = AtomicMetrics::new();
+        metrics.total_threads(4);
+        metrics.start_request();
+        metrics.start_request();
+        assert_eq!(metrics.busy_threads.load(Ordering::Relaxed), 2);
+        metrics.stop_request();
+        assert_eq!(metrics.busy_threads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn atomic_metrics_queue_depth() {
+        let metrics = AtomicMetrics::new();
+        metrics.queued_request();
+        metrics.queued_request();
+        metrics.dequeued_request();
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn stop_reason_variants() {
+        assert_eq!(StopReason::Crash as u8, 0);
+        assert_eq!(StopReason::Restart as u8, 1);
+        assert_eq!(StopReason::BootFailure as u8, 2);
+    }
+
+    #[test]
+    fn atomic_metrics_default() {
+        let metrics = AtomicMetrics::default();
+        assert_eq!(metrics.total_threads.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.busy_threads.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn duration_zero() {
+        let d = Duration::from_secs(0);
+        assert_eq!(d.as_secs(), 0);
+    }
+
+    #[test]
+    fn duration_from_secs() {
+        let d = Duration::from_secs(5);
+        assert_eq!(d.as_secs(), 5);
+    }
+}

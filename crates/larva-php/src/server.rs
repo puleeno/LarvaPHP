@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
-
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use http_body_util::Full;
@@ -43,6 +42,10 @@ pub struct Server {
     pub logger_level: Level,
     /// Open file cache: path -> (size, mtime, etag)
     pub file_cache: DashMap<String, CachedFile>,
+    /// Rate limiter (per-IP)
+    pub rate_limiter: RateLimiter,
+    /// Max request body size in bytes (default: 10 MB)
+    pub max_body_size: u64,
 }
 
 /// Cached file metadata (nginx open_file_cache equivalent).
@@ -51,6 +54,75 @@ pub struct CachedFile {
     pub size: u64,
     pub mtime: u64,
     pub etag: String,
+}
+
+/// Rate limiter configuration.
+#[derive(Clone, Debug)]
+pub struct RateLimitConfig {
+    /// Max requests per window per IP
+    pub max_requests: u64,
+    /// Window duration in seconds
+    pub window_secs: u64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_requests: 60,
+            window_secs: 60,
+        }
+    }
+}
+
+/// Per-IP rate limiter state.
+#[derive(Clone, Debug)]
+struct RateLimitEntry {
+    count: u64,
+    window_start: u64,
+}
+
+/// Thread-safe rate limiter using a fixed-window counter per IP.
+#[derive(Debug, Clone)]
+pub struct RateLimiter {
+    entries: Arc<DashMap<String, RateLimitEntry>>,
+    config: RateLimitConfig,
+}
+
+impl RateLimiter {
+    pub fn new(config: RateLimitConfig) -> Self {
+        Self {
+            entries: Arc::new(DashMap::new()),
+            config,
+        }
+    }
+
+    /// Check if the request from the given IP is allowed.
+    /// Returns true if allowed, false if rate limit exceeded.
+    pub fn check(&self, ip: &str) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let mut entry = self.entries.entry(ip.to_string()).or_insert(RateLimitEntry {
+            count: 0,
+            window_start: now,
+        });
+
+        // Reset window if expired
+        if now - entry.window_start >= self.config.window_secs {
+            entry.count = 1;
+            entry.window_start = now;
+            return true;
+        }
+
+        if entry.count >= self.config.max_requests {
+            return false;
+        }
+
+        entry.count += 1;
+        true
+    }
 }
 
 impl Server {
@@ -74,6 +146,8 @@ impl Server {
             is_registered: AtomicBool::new(false),
             logger_level: Level::INFO,
             file_cache: DashMap::new(),
+            rate_limiter: RateLimiter::new(RateLimitConfig::default()),
+            max_body_size: 10 * 1024 * 1024, // 10 MB
         })
     }
 
@@ -92,6 +166,8 @@ impl Server {
             is_registered: AtomicBool::new(true),
             logger_level: Level::INFO,
             file_cache: DashMap::new(),
+            rate_limiter: RateLimiter::new(RateLimitConfig::default()),
+            max_body_size: 10 * 1024 * 1024, // 10 MB
         }
     }
 
@@ -410,10 +486,13 @@ impl Server {
 
         loop {
             let (stream, _) = listener.accept().await.map_err(|e| Error::Io(e))?;
+            let peer_addr = stream.peer_addr().map_err(|e| Error::Io(e))?;
 
             let root = server_root.clone();
             let split_path = server_split_path.clone();
             let registered = self.is_registered.load(Ordering::Acquire);
+            let rate_limiter = self.rate_limiter.clone();
+            let max_body_size = self.max_body_size;
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
@@ -424,12 +503,32 @@ impl Server {
                             let root = root.clone();
                             let split_path = split_path.clone();
                             let registered = registered.clone();
+                            let rate_limiter = rate_limiter.clone();
+                            let max_body_size = max_body_size;
+                            let client_ip = peer_addr.ip().to_string();
                             async move {
                                 if !registered {
                                     return Ok::<Response<Full<Bytes>>, hyper::Error>(
                                         Response::builder()
                                             .status(StatusCode::SERVICE_UNAVAILABLE)
                                             .body(Full::new(Bytes::from("Service Unavailable")))
+                                            .unwrap(),
+                                    );
+                                }
+
+                                // Rate limiting check
+                                let allowed = rate_limiter.check(&client_ip);
+                                if !allowed {
+                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                        Response::builder()
+                                            .status(StatusCode::TOO_MANY_REQUESTS)
+                                            .header("content-type", "text/plain; charset=UTF-8")
+                                            .header(
+                                                "retry-after",
+                                                rate_limiter.config.window_secs.to_string(),
+                                            )
+                                            .header("server", "LarvaPHP")
+                                            .body(Full::new(Bytes::from("Too Many Requests")))
                                             .unwrap(),
                                     );
                                 }
@@ -572,6 +671,25 @@ impl Server {
                                     match frame {
                                         Ok(frame) => {
                                             if let Some(chunk) = frame.data_ref() {
+                                                if body_bytes.len() + chunk.len()
+                                                    > max_body_size as usize
+                                                {
+                                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                                        Response::builder()
+                                                            .status(
+                                                                StatusCode::PAYLOAD_TOO_LARGE,
+                                                            )
+                                                            .header(
+                                                                "content-type",
+                                                                "text/plain; charset=UTF-8",
+                                                            )
+                                                            .header("server", "LarvaPHP")
+                                                            .body(Full::new(Bytes::from(
+                                                                "Payload Too Large",
+                                                            )))
+                                                            .unwrap(),
+                                                    );
+                                                }
                                                 body_bytes.extend_from_slice(chunk);
                                             }
                                         }
@@ -1045,4 +1163,291 @@ fn is_sensitive_file(path: &str) -> bool {
     }
 
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === RateLimiter tests ===
+
+    #[test]
+    fn rate_limiter_counts_requests() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 3,
+            window_secs: 60,
+        });
+
+        assert!(limiter.check("127.0.0.1"));
+        assert!(limiter.check("127.0.0.1"));
+        assert!(limiter.check("127.0.0.1"));
+        assert!(!limiter.check("127.0.0.1"));
+        assert!(!limiter.check("127.0.0.1"));
+    }
+
+    #[test]
+    fn rate_limiter_per_ip_isolation() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 1,
+            window_secs: 60,
+        });
+
+        assert!(limiter.check("1.2.3.4"));
+        assert!(!limiter.check("1.2.3.4"));
+        assert!(limiter.check("5.6.7.8"));
+        assert!(!limiter.check("5.6.7.8"));
+    }
+
+    #[test]
+    fn rate_limiter_window_reset() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 1,
+            window_secs: 0,
+        });
+        // With window_secs=0, window always expires immediately, so every request is allowed
+        assert!(limiter.check("127.0.0.1"));
+        assert!(limiter.check("127.0.0.1"));
+        assert!(limiter.check("127.0.0.1"));
+    }
+
+    #[test]
+    fn rate_limiter_clones_share_state() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 2,
+            window_secs: 60,
+        });
+        let clone = limiter.clone();
+
+        assert!(limiter.check("127.0.0.1"));
+        assert!(clone.check("127.0.0.1"));
+        assert!(!limiter.check("127.0.0.1"));
+        assert!(!clone.check("127.0.0.1"));
+    }
+
+    #[test]
+    fn rate_limiter_default_config() {
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+        assert_eq!(limiter.config.max_requests, 60);
+        assert_eq!(limiter.config.window_secs, 60);
+
+        for _ in 0..60 {
+            assert!(limiter.check("127.0.0.1"));
+        }
+        assert!(!limiter.check("127.0.0.1"));
+    }
+
+    // === Server tests ===
+
+    #[test]
+    fn server_new_sets_defaults() {
+        let server = Server::new("C:\\www").unwrap();
+        assert_eq!(server.root(), "C:\\www");
+        assert_eq!(server.split_path(), &[".php".to_string()]);
+        assert_eq!(server.max_body_size, 10 * 1024 * 1024);
+        assert!(!server.is_registered());
+    }
+
+    #[test]
+    fn server_fallback_is_registered() {
+        let server = Server::fallback();
+        assert!(server.is_registered());
+        assert_eq!(server.root(), "");
+        assert_eq!(server.max_body_size, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn server_set_name_and_split_path() {
+        let mut server = Server::new("C:\\www").unwrap();
+        server.set_name("example.com".to_string());
+        server.set_split_path(vec![".php".to_string(), ".phtml".to_string()]);
+        assert_eq!(server.name(), "example.com");
+        assert_eq!(server.split_path(), &[".php".to_string(), ".phtml".to_string()]);
+    }
+
+    // === url_decode tests ===
+
+    #[test]
+    fn url_decode_plain_string() {
+        assert_eq!(url_decode("hello"), "hello");
+    }
+
+    #[test]
+    fn url_decode_percent_encoded() {
+        assert_eq!(url_decode("%48%65%6c%6c%6f"), "Hello");
+    }
+
+    #[test]
+    fn url_decode_plus_as_space() {
+        assert_eq!(url_decode("hello+world"), "hello world");
+    }
+
+    #[test]
+    fn url_decode_mixed() {
+        assert_eq!(url_decode("%74%65%73%74+path"), "test path");
+    }
+
+    #[test]
+    fn url_decode_invalid_hex_passthrough() {
+        assert_eq!(url_decode("%ZZ"), "%ZZ");
+    }
+
+    #[test]
+    fn url_decode_empty() {
+        assert_eq!(url_decode(""), "");
+    }
+
+    // === sanitize_path tests ===
+
+    #[test]
+    fn sanitize_path_normal() {
+        let path = PathBuf::from("C:/www/index.php");
+        let result = sanitize_path(&path).unwrap();
+        assert!(result.to_string_lossy().contains("www"));
+        assert!(result.to_string_lossy().contains("index.php"));
+    }
+
+    #[test]
+    fn sanitize_path_traversal_resolves_dotdot() {
+        let path = PathBuf::from("C:/www/../../etc/passwd");
+        let result = sanitize_path(&path).unwrap();
+        // .. segments are resolved; result no longer contains www
+        let s = result.to_string_lossy().to_string();
+        assert!(!s.contains("www"));
+        assert!(s.contains("passwd"));
+    }
+
+    #[test]
+    fn sanitize_path_current_dir_ignored() {
+        let path = PathBuf::from("C:/www/./index.php");
+        let result = sanitize_path(&path).unwrap();
+        assert!(result.to_string_lossy().contains("www"));
+        assert!(result.to_string_lossy().contains("index.php"));
+    }
+
+    #[test]
+    fn sanitize_path_empty_rejected() {
+        let path = PathBuf::from("");
+        let result = sanitize_path(&path);
+        assert!(result.is_err());
+    }
+
+    // === parse_cgi_output tests ===
+
+    #[test]
+    fn parse_cgi_output_with_headers_and_body() {
+        let output = "Status: 200 OK\r\nContent-Type: text/html\r\n\r\n<body>hello</body>";
+        let (status, headers, body) = parse_cgi_output(output);
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.iter().any(|(n, v)| n == "Content-Type" && v == "text/html"));
+        assert!(!headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("Status")));
+        assert_eq!(body, b"<body>hello</body>");
+    }
+
+    #[test]
+    fn parse_cgi_output_no_headers() {
+        let output = "just a body";
+        let (status, headers, body) = parse_cgi_output(output);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"just a body");
+        // Default content-type is added when none present
+        assert!(headers.iter().any(|(n, v)| n == "content-type" && v == "text/html; charset=UTF-8"));
+    }
+
+    #[test]
+    fn parse_cgi_output_status_302() {
+        let output = "Status: 302 Found\r\nLocation: /login\r\n\r\n";
+        let (status, headers, body) = parse_cgi_output(output);
+        assert_eq!(status, StatusCode::FOUND);
+        assert!(headers.iter().any(|(n, v)| n == "Location" && v == "/login"));
+        assert_eq!(body, b"");
+    }
+
+    #[test]
+    fn parse_cgi_output_default_content_type() {
+        let output = "Status: 200 OK\r\n\r\n<body></body>";
+        let (_status, headers, _body) = parse_cgi_output(output);
+        assert!(headers.iter().any(|(n, v)| n == "content-type" && v == "text/html; charset=UTF-8"));
+    }
+
+    // === mime_type tests ===
+
+    #[test]
+    fn mime_type_css() {
+        assert_eq!(Server::mime_type("style.css"), "text/css; charset=UTF-8");
+    }
+
+    #[test]
+    fn mime_type_js() {
+        assert_eq!(Server::mime_type("app.js"), "application/javascript; charset=UTF-8");
+    }
+
+    #[test]
+    fn mime_type_html() {
+        assert_eq!(Server::mime_type("index.html"), "text/html; charset=UTF-8");
+    }
+
+    #[test]
+    fn mime_type_png() {
+        assert_eq!(Server::mime_type("image.png"), "image/png");
+    }
+
+    #[test]
+    fn mime_type_unknown() {
+        assert_eq!(Server::mime_type("file.xyz"), "application/octet-stream");
+    }
+
+    #[test]
+    fn mime_type_no_extension() {
+        assert_eq!(Server::mime_type("Makefile"), "application/octet-stream");
+    }
+
+    // === is_sensitive_file tests ===
+
+    #[test]
+    fn sensitive_file_wp_config() {
+        assert!(is_sensitive_file("C:/www/wp-config.php"));
+    }
+
+    #[test]
+    fn sensitive_file_env() {
+        assert!(is_sensitive_file("C:/www/.env"));
+    }
+
+    #[test]
+    fn sensitive_file_dot_file() {
+        assert!(is_sensitive_file("C:/www/.htaccess"));
+    }
+
+    #[test]
+    fn sensitive_file_sql() {
+        assert!(is_sensitive_file("C:/www/db.sql"));
+    }
+
+    #[test]
+    fn not_sensitive_php() {
+        assert!(!is_sensitive_file("C:/www/index.php"));
+    }
+
+    #[test]
+    fn not_sensitive_css() {
+        assert!(!is_sensitive_file("C:/www/style.css"));
+    }
+
+    #[test]
+    fn sensitive_file_git_dir() {
+        assert!(is_sensitive_file("C:/www/.git/config"));
+    }
+
+    #[test]
+    fn sensitive_file_composer_lock() {
+        assert!(is_sensitive_file("C:/www/composer.lock"));
+    }
+
+    // === http_date tests ===
+
+    #[test]
+    fn http_date_epoch() {
+        let date = http_date(0);
+        assert_eq!(date, "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
 }
