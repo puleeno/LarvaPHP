@@ -1,0 +1,190 @@
+# LarvaPHP
+
+**LarvaPHP** - A modern PHP application server written in Rust. A port of [FrankenPHP](https://frankenphp.dev) that embeds PHP via the Zend Engine C API and serves PHP applications through a high-performance HTTP server built on [Hyper](https://hyper.rs) and [Tokio](https://tokio.rs).
+
+## Project Structure
+
+```
+larva-php/
+├── Cargo.toml                      # Workspace root
+├── README.md
+├── docs/
+│   ├── architecture.md             # System architecture
+│   ├── configuration.md            # Configuration reference
+│   ├── api.md                      # Public API documentation
+│   ├── hot-reload.md               # Hot reload guide
+│   ├── middleware.md               # Middleware & rewrite rules
+│   └── examples.md                 # Usage examples
+└── crates/
+    ├── larva-php/                  # Main crate
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── lib.rs              # Public API entry point
+    │       ├── main.rs             # CLI binary
+    │       ├── config.rs           # Server config (Strategy/Builder/Chain of Responsibility)
+    │       ├── server.rs           # Server blocks & rate limiting
+    │       ├── context.rs          # Per-request PHP context
+    │       ├── cgi.rs              # CGI variables & path splitting
+    │       ├── thread.rs           # PHP thread state machine
+    │       ├── worker.rs           # Persistent worker mode
+    │       ├── watcher.rs          # File watching & hot reload
+    │       ├── errors.rs           # Error types
+    │       ├── options.rs          # Configuration options (Builder pattern)
+    │       ├── env.rs              # Environment variable management
+    │       ├── types.rs            # PHP zval wrappers
+    │       ├── metrics.rs          # Prometheus-compatible metrics
+    │       ├── scaling.rs          # Auto-scaling
+    │       ├── mercure.rs          # Mercure real-time
+    │       ├── embed.rs            # Embedded PHP app
+    │       ├── cli.rs              # CLI script execution
+    │       └── phpinfo.rs          # phpinfo() integration
+    ├── larva-php-sys/              # FFI bindings to Zend Engine
+    ├── larva-php-caddy/            # Caddy module
+    └── larva-php-extgen/           # Extension generator
+```
+
+## Features
+
+- **PHP 8.2+ support** via Zend Engine C API (embedded, not CGI)
+- **High-performance HTTP server** built on Hyper/Tokio
+- **Multiple config formats**: CLI `--root`, Apache `<DocumentRoot>`, Nginx `root`, Caddyfile `root`
+- **Middleware chain**: Chain of Responsibility pattern for request preprocessing (rewrite, .htaccess-style rules)
+- **Rate limiting**: Fixed-window per-IP rate limiter with configurable limits
+- **Hot reload**: File watching with debounce and atomic config swap (ArcSwap)
+- **Security headers**: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`
+- **Sensitive file protection**: Blocks access to `.env`, `.git/`, `wp-config.php`, etc.
+- **Worker mode**: Persistent PHP scripts for reduced overhead
+- **Prometheus metrics**: Built-in metrics collection
+- **Mercure support**: Real-time updates (optional feature)
+- **Caddy module**: Run as a Caddy PHP module
+
+## Quick Start
+
+### Build
+
+```powershell
+# Set up MSVC environment (required on Windows)
+$env:PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64;$env:PATH"
+$env:INCLUDE = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt;$env:INCLUDE"
+$env:LIB = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\lib\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64;$env:LIB"
+
+cargo build --release
+```
+
+### Serve a PHP Application
+
+```powershell
+# Serve from a directory (CLI --root format)
+.\target\release\larva-php.exe --root C:\path\to\php-app --addr 127.0.0.1:8000
+
+# Run a PHP script directly
+.\target\release\larva-php.exe script.php arg1 arg2
+```
+
+### Test with WordPress
+
+```powershell
+.\target\release\larva-php.exe --root C:\Users\Administrator\Projects\wordpress.org --addr 127.0.0.1:9000
+# Visit http://127.0.0.1:9000
+```
+
+## Configuration
+
+### CLI Options
+
+| Option | Short | Default | Description |
+|--------|-------|---------|-------------|
+| `--root <DIR>` | `-r` | (required for server mode) | Document root directory |
+| `--addr <ADDR>` | `-a` | `127.0.0.1:8000` | Bind address |
+| `--version` | `-v` | - | Show version |
+| `--help` | `-h` | - | Show help |
+
+### Supported Config Formats
+
+LarvaPHP accepts configuration in multiple formats through the Strategy pattern:
+
+| Format | Parser | Example |
+|--------|--------|---------|
+| CLI | `CliParser` | `--root /var/www/html` |
+| Apache | `ApacheParser` | `<DocumentRoot "/var/www/html">` |
+| Nginx | `NginxParser` | `root /var/www/html;` |
+| Caddy | `CaddyParser` | `root * /var/www/html` |
+
+See [`docs/configuration.md`](docs/configuration.md) for details.
+
+### Rate Limiting
+
+Fixed-window per-IP rate limiter (default: 60 requests per 60 seconds):
+
+```rust
+use larva_php::config::{RateLimitConfig, RateLimiter};
+
+let limiter = RateLimiter::new(RateLimitConfig {
+    max_requests: 30,
+    window_secs: 60,
+});
+
+if limiter.check("192.168.1.1") {
+    // allow request
+} else {
+    // return HTTP 429
+}
+```
+
+## Hot Reload
+
+LarvaPHP supports hot reloading of configuration and PHP source files using the `notify` crate with debounce coalescing.
+
+```rust
+use larva_php::config::hot_reload::HotReloadManager;
+
+let mut mgr = HotReloadManager::new("cli", "/path/to/config", loader.clone());
+mgr.watch_dir(PathBuf::from("/path/to/watch"));
+mgr.start()?;
+
+// When files change, config is re-parsed and atomically swapped
+```
+
+See [`docs/hot-reload.md`](docs/hot-reload.md) for details.
+
+## Middleware & Rewrite
+
+LarvaPHP includes a Chain of Responsibility middleware pipeline for request preprocessing:
+
+```rust
+use larva_php::config::{MiddlewareChain, RewriteMiddleware, RewriteRule, RewriteFlag};
+
+// .htaccess-style rewrite rules
+let rules = vec![
+    RewriteRule::new(r"^/old/(.+)$", "/new/$1", RewriteFlag::Last)?,
+    RewriteRule::new(r"^/legacy/(.+)$", "/current/$1", RewriteFlag::Next)?,
+];
+
+let mw = RewriteMiddleware::new(rules);
+let chain = MiddlewareChain::new().add(Arc::new(mw));
+```
+
+See [`docs/middleware.md`](docs/middleware.md) for details.
+
+## Testing
+
+```powershell
+cargo test --lib
+```
+
+All tests run without requiring a PHP installation (pure Rust unit tests).
+
+## Architecture
+
+See [`docs/architecture.md`](docs/architecture.md) for detailed architecture.
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
+
+## Related Projects
+
+- [FrankenPHP](https://frankenphp.dev) - The Go-based PHP application server that inspired this port
+- [PHP](https://php.net) - The Hypertext Preprocessor language
+- [Hyper](https://hyper.rs) - Fast HTTP library for Rust
+- [Tokio](https://tokio.rs) - Async runtime for Rust
