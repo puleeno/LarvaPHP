@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LarvaPHP Documentation</title>
+    <style>
+        :root {
+            --background: #0f172a;
+            --foreground: #f8fafc;
+            --muted: #64748b;
+            --muted-foreground: #94a3b8;
+            --card: #1e293b;
+            --card-foreground: #f8fafc;
+            --border: #334155;
+            --primary: #3b82f6;
+            --primary-foreground: #ffffff;
+            --accent: #8b5cf6;
+            --radius: 8px;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html { scroll-behavior: smooth; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: var(--background);
+            color: var(--foreground);
+            line-height: 1.6;
+        }
+        a { color: var(--primary); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+
+        /* Header */
+        header {
+            background: var(--card);
+            border-bottom: 1px solid var(--border);
+            padding: 2rem 0;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        .header-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 1.5rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logo {
+            font-size: 1.5rem;
+            font-weight: 700;
+            letter-spacing: -0.025em;
+            color: var(--foreground);
+        }
+        .logo span { color: var(--primary); }
+        nav ul {
+            display: flex;
+            gap: 1.5rem;
+            list-style: none;
+        }
+        nav a {
+            color: var(--muted-foreground);
+            font-size: 0.95rem;
+            font-weight: 500;
+        }
+        nav a:hover { color: var(--primary); text-decoration: none; }
+
+        /* Hero */
+        .hero {
+            padding: 4rem 1.5rem;
+            text-align: center;
+            background: linear-gradient(135deg, var(--card) 0%, #0f172a 100%);
+            border-bottom: 1px solid var(--border);
+        }
+        .hero h1 {
+            font-size: 3rem;
+            font-weight: 800;
+            letter-spacing: -0.03em;
+            margin-bottom: 1rem;
+        }
+        .hero h1 span { color: var(--primary); }
+        .hero p {
+            font-size: 1.25rem;
+            color: var(--muted-foreground);
+            max-width: 600px;
+            margin: 0 auto 2rem;
+        }
+        .hero-links {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        .btn {
+            padding: 0.75rem 1.5rem;
+            border-radius: var(--radius);
+            font-weight: 600;
+            font-size: 0.95rem;
+            display: inline-block;
+        }
+        .btn-primary {
+            background: var(--primary);
+            color: var(--primary-foreground);
+        }
+        .btn-primary:hover { background: #2563eb; text-decoration: none; }
+        .btn-outline {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--foreground);
+        }
+        .btn-outline:hover {
+            border-color: var(--primary);
+            color: var(--primary);
+            text-decoration: none;
+        }
+
+        /* Grid */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 3rem 1.5rem;
+        }
+        .docs-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 3rem;
+        }
+        .doc-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 1.5rem;
+            transition: transform 0.2s, border-color 0.2s;
+        }
+        .doc-card:hover {
+            transform: translateY(-2px);
+            border-color: var(--primary);
+        }
+        .doc-card h3 {
+            font-size: 1.125rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            color: var(--foreground);
+        }
+        .doc-card p {
+            font-size: 0.9rem;
+            color: var(--muted-foreground);
+            margin-bottom: 1rem;
+        }
+        .doc-card a {
+            color: var(--primary);
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+        .doc-card a:hover { text-decoration: underline; }
+
+        /* Tags */
+        .tag {
+            display: inline-block;
+            font-size: 0.75rem;
+            padding: 0.125rem 0.5rem;
+            border-radius: 999px;
+            background: #334155;
+            color: var(--muted-foreground);
+            margin-bottom: 0.5rem;
+        }
+        .tag.featured { background: var(--primary); color: var(--primary-foreground); }
+
+        /* Features */
+        .features {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-top: 3rem;
+            padding-top: 3rem;
+            border-top: 1px solid var(--border);
+        }
+        .feature {
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+        }
+        .feature-icon {
+            font-size: 1.5rem;
+        }
+        .feature h4 {
+            font-size: 0.95rem;
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+        }
+        .feature p {
+            font-size: 0.85rem;
+            color: var(--muted-foreground);
+        }
+
+        /* Footer */
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 2rem 1.5rem;
+            text-align: center;
+        }
+        .footer-content {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        footer p {
+            color: var(--muted-foreground);
+            font-size: 0.875rem;
+        }
+
+        /* Mobile */
+        @media (max-width: 640px) {
+            .hero h1 { font-size: 2rem; }
+            nav { display: none; }
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <div class="header-content">
+        <div class="logo">Larva<span>PHP</span></div>
+        <nav>
+            <ul>
+                <li><a href="#overview">Overview</a></li>
+                <li><a href="#configuration">Configuration</a></li>
+                <li><a href="#api">API Reference</a></li>
+                <li><a href="#hot-reload">Hot Reload</a></li>
+                <li><a href="#middleware">Middleware</a></li>
+                <li><a href="#examples">Examples</a></li>
+                <li><a href="#architecture">Architecture</a></li>
+            </ul>
+        </nav>
+    </div>
+</header>
+
+<section class="hero">
+    <div class="hero-content">
+        <h1>Larva<span>PHP</span> Documentation</h1>
+        <p>A modern PHP application server written in Rust. Embedding PHP via the Zend Engine C API with Hyper/Tokio HTTP server.</p>
+        <div class="hero-links">
+            <a href="README.md" class="btn btn-primary">Read README</a>
+            <a href="configuration.md" class="btn btn-outline">Configuration</a>
+            <a href="api.md" class="btn btn-outline">API Reference</a>
+        </div>
+    </div>
+</section>
+
+<div class="container">
+    <div class="docs-grid">
+        <div class="doc-card">
+            <span class="tag featured">Start Here</span>
+            <h3>Overview</h3>
+            <p>Project introduction, features, quick start, and CLI usage.</p>
+            <a href="README.md">Read Overview &rarr;</a>
+        </div>
+        <div class="doc-card">
+            <span class="tag">Configuration</span>
+            <h3>Configuration</h3>
+            <p>CLI, Apache, Nginx, and Caddy config formats. Rate limiting, security headers, MIME types.</p>
+            <a href="configuration.md">Read Configuration &rarr;</a>
+        </div>
+        <div class="doc-card">
+            <span class="tag">API Reference</span>
+            <h3>API Reference</h3>
+            <p>Complete public API reference for all modules, structs, traits, and methods.</p>
+            <a href="api.md">Read API &rarr;</a>
+        </div>
+        <div class="doc-card">
+            <span class="tag">Hot Reload</span>
+            <h3>Hot Reload</h3>
+            <p>File watching with debounce and atomic config swap using ArcSwap.</p>
+            <a href="hot-reload.md">Read Hot Reload &rarr;</a>
+        </div>
+        <div class="doc-card">
+            <span class="tag">Middleware</span>
+            <h3>Middleware & Rewrite</h3>
+            <p>Chain of Responsibility middleware, .htaccess-style URL rewriting.</p>
+            <a href="middleware.md">Read Middleware &rarr;</a>
+        </div>
+        <div class="doc-card">
+            <span class="tag">Examples</span>
+            <h3>Examples</h3>
+            <p>13+ complete runnable examples for common scenarios.</p>
+            <a href="examples.md">Read Examples &rarr;</a>
+        </div>
+        <div class="doc-card">
+            <span class="tag">Architecture</span>
+            <h3>Architecture</h3>
+            <p>System architecture, module breakdown, design patterns, performance, security.</p>
+            <a href="architecture.md">Read Architecture &rarr;</a>
+        </div>
+    </div>
+
+    <div class="features">
+        <div class="feature">
+            <div class="feature-icon">&#128269;</div>
+            <div>
+                <h4>PHP 8.2+ Embedded</h4>
+                <p>Zend Engine C API via FFI, not CGI subprocess.</p>
+            </div>
+        </div>
+        <div class="feature">
+            <div class="feature-icon">&#128663;</div>
+            <div>
+                <h4>Hyper + Tokio</h4>
+                <p>High-performance async HTTP server on Rust.</p>
+            </div>
+        </div>
+        <div class="feature">
+            <div class="feature-icon">&#128204;</div>
+            <div>
+                <h4>Multi-Format Config</h4>
+                <p>CLI, Apache, Nginx, Caddy formats via Strategy pattern.</p>
+            </div>
+        </div>
+        <div class="feature">
+            <div class="feature-icon">&#128266;</div>
+            <div>
+                <h4>Hot Reload</h4>
+                <p>File watching with debounce and ArcSwap atomic swap.</p>
+            </div>
+        </div>
+        <div class="feature">
+            <div class="feature-icon">&#128736;</div>
+            <div>
+                <h4>Middleware Chain</h4>
+                <p>Chain of Responsibility for rewrite and access control.</p>
+            </div>
+        </div>
+        <div class="feature">
+            <div class="feature-icon">&#128274;</div>
+            <div>
+                <h4>Rate Limiting</h4>
+                <p>Fixed-window per-IP rate limiter with 429 responses.</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<footer>
+    <div class="footer-content">
+        <p>&copy; 2026 LarvaPHP contributors. Licensed under MIT.</p>
+        <p>
+            <a href="https://github.com/larva-php/larva-php" style="color: var(--primary);">GitHub</a> &
+            <a href="https://frankenphp.dev" style="color: var(--primary);">FrankenPHP</a>
+        </p>
+    </div>
+</footer>
+
+</body>
+</html>
