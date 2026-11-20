@@ -1,0 +1,17 @@
+Source: larva-php
+Section: web
+Priority: optional
+Maintainer: LarvaPHP Contributors <dev@larva-php.local>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, php-all-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/larva-php/larva-php
+
+Package: larva-php
+Architecture: any
+Depends: ${misc:Depends}, php-cgi
+Description: A modern PHP application server written in Rust
+ LarvaPHP embeds PHP via the Zend Engine C API and serves PHP applications
+ through a high-performance asynchronous HTTP server built on Hyper and Tokio.
+ .
+ It supports multiple config formats (CLI, Apache, Nginx, Caddy), rate
+ limiting, hot reload, middleware, X-Sendfile, and a Mercure hub.
