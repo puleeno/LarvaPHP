@@ -335,6 +335,8 @@ fn runtime_demo() -> ExitCode {
         headers: vec![("host".to_string(), "localhost".to_string())],
         body: Vec::new(),
         script_path: "/app/index.php".to_string(),
+        server_name: "localhost".to_string(),
+        server_port: "80".to_string(),
     };
 
     let mut ok = 0;

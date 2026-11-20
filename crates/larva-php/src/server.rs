@@ -1065,6 +1065,16 @@ fn execute_php_cgi(
     params.push(("REDIRECT_STATUS".into(), "200".into()));
     params.push(("GATEWAY_INTERFACE".into(), "CGI/1.1".into()));
     params.push(("SERVER_SOFTWARE".into(), "LarvaPHP/1.0".into()));
+    // HTTP_HOST (Host header) so WordPress/URLs resolve to the right host.
+    let http_host = if ctx.server_port.is_empty()
+        || ctx.server_port == "80"
+        || ctx.server_port == "443"
+    {
+        ctx.server_name.clone()
+    } else {
+        format!("{}:{}", ctx.server_name, ctx.server_port)
+    };
+    params.push(("HTTP_HOST".into(), http_host.clone()));
 
     // Fastest path: 2-layer runtime worker pool (master → shm → worker → PHP).
     // The master never runs PHP; a segfault in a worker is isolated and respawned.
@@ -1087,12 +1097,16 @@ fn execute_php_cgi(
         if !ctx.content_type.is_empty() {
             req_headers.push(("CONTENT_TYPE".to_string(), ctx.content_type.clone()));
         }
+        // HTTP_HOST so the worker's php-cgi resolves the correct host.
+        req_headers.push(("HTTP_HOST".to_string(), http_host.clone()));
         if let Some(result) = crate::runtime::try_dispatch(&crate::runtime::Request {
             method: ctx.request_method.clone(),
             uri: ctx.request_uri.clone(),
             headers: req_headers,
             body: body.to_vec(),
             script_path: script_path.to_string(),
+            server_name: ctx.server_name.clone(),
+            server_port: ctx.server_port.clone(),
         }) {
             return result.map_err(Error::Ffi);
         }
