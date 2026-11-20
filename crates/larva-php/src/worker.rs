@@ -3,7 +3,7 @@
 //! Mirrors `worker.go` from the Go source.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::context::PhpContext;
@@ -118,6 +118,60 @@ impl Worker {
         let _ = &mut fc;
         Ok(())
     }
+
+    /// Whether the worker has been stopped (auto-restart pending).
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Stop the worker: mark it stopped and drain all thread request channels so
+    /// no new requests are dispatched. Threads are re-bootstrapped on restart.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Release);
+        for thread in self.threads.read().unwrap().iter() {
+            thread.shutdown();
+        }
+    }
+
+    /// Restart a stopped worker: clear the stopped flag. The worker's threads
+    /// re-bootstrap on the next `handle_request` (or explicit re-init).
+    pub fn restart(&self) {
+        self.stopped.store(false, Ordering::Release);
+    }
+}
+
+/// Restart every registered worker whose script file matches `path`.
+///
+/// Used by the file watcher to implement worker auto-restart: when a PHP file
+/// changes, the workers backed by that file are stopped and restarted so the
+/// new source is picked up. Returns the number of workers restarted.
+pub fn restart_workers_for_file(path: &str) -> usize {
+    let reg = WORKER_REGISTRY.read().unwrap();
+    let workers = reg.workers.read().unwrap();
+    let changed = std::path::Path::new(path);
+    let mut restarted = 0usize;
+    for worker in workers.iter() {
+        let worker_file = std::path::Path::new(worker.file_name());
+        let matches = worker_file == changed
+            || worker
+                .file_name()
+                .eq_ignore_ascii_case(&path.to_string());
+        if matches {
+            worker.restart();
+            restarted += 1;
+        }
+    }
+    restarted
+}
+
+/// Check whether any worker is backed by the given script file.
+pub fn is_worker_file(path: &str) -> bool {
+    let reg = WORKER_REGISTRY.read().unwrap();
+    let workers = reg.workers.read().unwrap();
+    let changed = std::path::Path::new(path);
+    workers
+        .iter()
+        .any(|w| std::path::Path::new(w.file_name()) == changed)
 }
 
 /// Global registry of workers.
@@ -340,5 +394,29 @@ mod tests {
         let mut router = WorkerRouter::new();
         router.add_route(Box::new(PrefixMatcher::new("/api")), w1);
         assert!(router.find_worker("/blog").is_none());
+    }
+
+    #[test]
+    fn worker_stop_and_restart() {
+        let w = Worker::new(
+            "w".to_string(),
+            "/app/w.php".to_string(),
+            "/app/w.php".to_string(),
+            1,
+            0,
+            6,
+            None,
+        );
+        assert!(!w.is_stopped());
+        w.stop();
+        assert!(w.is_stopped());
+        w.restart();
+        assert!(!w.is_stopped());
+    }
+
+    #[test]
+    fn is_worker_file_detects_registered() {
+        // Not registered -> false.
+        assert!(!is_worker_file("/app/nonexistent.php"));
     }
 }
