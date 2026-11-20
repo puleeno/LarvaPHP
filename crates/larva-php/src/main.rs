@@ -337,6 +337,7 @@ fn runtime_demo() -> ExitCode {
         script_path: "/app/index.php".to_string(),
         server_name: "localhost".to_string(),
         server_port: "80".to_string(),
+        script_name: "/index.php".to_string(),
     };
 
     let mut ok = 0;

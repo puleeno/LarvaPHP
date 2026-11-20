@@ -20,6 +20,8 @@ pub struct Request {
     pub server_name: String,
     /// Listen port, for SERVER_PORT.
     pub server_port: String,
+    /// The actual script name (e.g. /index.php), for SCRIPT_NAME/PHP_SELF.
+    pub script_name: String,
 }
 
 /// The result of executing a PHP script.
@@ -84,12 +86,13 @@ impl PhpExecutor for CgiExecutor {
         cmd.env("REQUEST_METHOD", &req.method);
         cmd.env("REQUEST_URI", &req.uri);
         // Split query string from the URI (e.g. ?step=1&language=en_US).
-        let (path, query) = match req.uri.split_once('?') {
+        let (_path, query) = match req.uri.split_once('?') {
             Some((p, q)) => (p, q),
             None => (req.uri.as_str(), ""),
         };
-        cmd.env("SCRIPT_NAME", path);
         cmd.env("QUERY_STRING", query);
+        cmd.env("SCRIPT_NAME", &req.script_name);
+        cmd.env("PHP_SELF", &req.script_name);
         cmd.env("SERVER_NAME", &req.server_name);
         cmd.env("SERVER_PORT", &req.server_port);
         cmd.env("SCRIPT_FILENAME", &req.script_path);

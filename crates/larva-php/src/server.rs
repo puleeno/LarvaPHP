@@ -709,15 +709,32 @@ impl Server {
                                     // try_files fallback: if the resolved path doesn't
                                     // exist (or is a directory without index), fall back
                                     // to index.php (front controller / permalink support).
-                                    if let Some(ref p) = resolved {
-                                        if std::path::Path::new(p).exists() {
-                                            resolved
-                                        } else {
-                                            resolve_index_php_static(&uri, &root)
-                                        }
-                                    } else {
-                                        resolve_index_php_static(&uri, &root)
-                                    }
+                                    // Static assets (.ico, .css, .js, images) that don't
+                                    // exist return 404 instead (no front-controller
+                        // fallback), which avoids WordPress building wrong redirect URLs
+                        // like /favicon.ico/wp-admin/install.php.
+                        if let Some(ref p) = resolved {
+                            if std::path::Path::new(p).exists() {
+                                resolved
+                            } else {
+                                let is_static = std::path::Path::new(p)
+                                    .extension()
+                                    .map(|e| e.to_string_lossy() != "php")
+                                    .unwrap_or(false);
+                                if is_static {
+                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                        Response::builder()
+                                            .status(StatusCode::NOT_FOUND)
+                                            .header("server", "LarvaPHP")
+                                            .body(Full::new(Bytes::from("Not Found")))
+                                            .unwrap(),
+                                    );
+                                }
+                                resolve_index_php_static(&uri, &root)
+                            }
+                        } else {
+                            resolve_index_php_static(&uri, &root)
+                        }
                                 };
 
                                 let Some(path) = script_path else {
@@ -1048,7 +1065,18 @@ fn execute_php_cgi(
     if !ctx.query_string.is_empty() {
         params.push(("QUERY_STRING".into(), ctx.query_string.clone()));
     }
-    params.push(("SCRIPT_NAME".into(), ctx.script_name.clone()));
+    // SCRIPT_NAME must reflect the ACTUAL script (e.g. /index.php when the
+    // request fell back to the front controller), not the original URI. This
+    // lets WordPress build correct URLs/redirects (e.g. /wp-admin/install.php).
+    let script_name = std::path::Path::new(&native_script_str)
+        .strip_prefix(&ctx.document_root)
+        .ok()
+        .and_then(|rel| {
+            let s = rel.to_string_lossy().replace('\\', "/");
+            if s.is_empty() { None } else { Some(format!("/{}", s)) }
+        })
+        .unwrap_or_else(|| ctx.script_name.clone());
+    params.push(("SCRIPT_NAME".into(), script_name.clone()));
     params.push(("SCRIPT_FILENAME".into(), native_script_str.clone()));
     params.push(("DOCUMENT_ROOT".into(), ctx.document_root.clone()));
     params.push(("SERVER_PROTOCOL".into(), ctx.server_protocol.clone()));
@@ -1061,10 +1089,7 @@ fn execute_php_cgi(
     if !ctx.content_length.is_empty() {
         params.push(("CONTENT_LENGTH".into(), ctx.content_length.clone()));
     }
-    if !ctx.path_info.is_empty() {
-        params.push(("PATH_INFO".into(), ctx.path_info.clone()));
-    }
-    params.push(("PHP_SELF".into(), ctx.script_name.clone()));
+    params.push(("PHP_SELF".into(), script_name.clone()));
     params.push(("REDIRECT_STATUS".into(), "200".into()));
     params.push(("GATEWAY_INTERFACE".into(), "CGI/1.1".into()));
     params.push(("SERVER_SOFTWARE".into(), "LarvaPHP/1.0".into()));
@@ -1110,6 +1135,7 @@ fn execute_php_cgi(
             script_path: script_path.to_string(),
             server_name: ctx.server_name.clone(),
             server_port: ctx.server_port.clone(),
+            script_name: script_name.clone(),
         }) {
             return result.map_err(Error::Ffi);
         }
