@@ -1066,6 +1066,11 @@ fn execute_php_cgi(
     params.push(("GATEWAY_INTERFACE".into(), "CGI/1.1".into()));
     params.push(("SERVER_SOFTWARE".into(), "LarvaPHP/1.0".into()));
 
+    // NOTE: embedded PHP (feature "embedded") is experimental and requires the
+    // exact PHP 8.x ABI (sapi_module_struct / zend_file_handle layouts). Without
+    // PHP development headers the struct layout is wrong and PHP crashes, so it
+    // is NOT auto-invoked here. See embed_php.rs for details.
+
     // Fast path: reuse a persistent FastCGI backend (no per-request spawn).
     // Falls through to CGI spawn on any error or when the feature is disabled.
     #[cfg(feature = "fcgi")]

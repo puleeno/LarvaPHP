@@ -29,6 +29,7 @@ pub mod completions;
 pub mod config;
 pub mod context;
 pub mod embed;
+pub mod embed_php;
 pub mod env;
 pub mod errors;
 pub mod fastcgi;
