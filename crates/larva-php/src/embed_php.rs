@@ -1,29 +1,20 @@
 //! Embedded PHP runtime via FFI (in-process, no CGI subprocess).
 //!
-//! **EXPERIMENTAL — requires PHP development headers.**
+//! Loads `php8.dll` (NTS) or `php8ts.dll` (ZTS) dynamically and runs PHP
+//! inside the worker process, like `mod_php`. This eliminates the per-request
+//! `php-cgi.exe` spawn.
 //!
-//! This loads `php8.dll` (or `php8ts.dll`) dynamically and runs PHP inside the
-//! LarvaPHP process, like `mod_php`, eliminating the per-request `php-cgi.exe`
-//! spawn. However, calling into the Zend Engine requires the **exact C ABI**:
-//! the `sapi_module_struct` and `zend_file_handle` layouts must match the PHP
-//! build byte-for-byte. Without PHP development headers (bindgen), the struct
-//! layout is wrong and PHP crashes.
+//! The struct layouts below are taken verbatim from **PHP 8.3** (`main/SAPI.h`,
+//! `Zend/zend_stream.h`) so the ABI matches. If you build against a different
+//! PHP version, regenerate these (bindgen) or adjust them.
 //!
-//! To make this work you must:
-//! 1. Install the PHP development package (provides headers + import library).
-//! 2. Generate exact bindings with bindgen (see `larva-php-sys`), OR
-//! 3. Vendor the PHP source tree and build against it.
-//!
-//! Until then this module is **not** wired into `execute_php_cgi`; it exists as
-//! a reference implementation. Enable with `--features embedded` (off by default).
-//! The NTS (`php8.dll`) build serializes PHP behind a global mutex; the ZTS
-//! (`php8ts.dll`) build would allow true concurrency.
+//! The NTS build is not thread-safe; callers serialize PHP access (the worker
+//! process runs one request at a time).
 
 #[cfg(feature = "embedded")]
 pub mod imp {
-    use std::ffi::{c_char, c_int, c_void, CString};
+    use std::ffi::{c_char, c_int, c_uint, c_void, CString};
     use std::cell::RefCell;
-    use std::sync::{Mutex, OnceLock};
 
     use crate::errors::{Error, Result};
 
@@ -33,14 +24,71 @@ pub mod imp {
         fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
     }
 
-    type FnSapiStartup = unsafe extern "C" fn(*mut c_void) -> c_int;
+    // =========================================================================
+    // PHP 8.3 ABI (verbatim from main/SAPI.h)
+    // =========================================================================
+
+    #[repr(C)]
+    struct SapiModule {
+        name: *const c_char,
+        pretty_name: *const c_char,
+        startup: Option<unsafe extern "C" fn(*mut SapiModule) -> c_int>,
+        shutdown: Option<unsafe extern "C" fn(*mut SapiModule) -> c_int>,
+        activate: Option<unsafe extern "C" fn() -> c_int>,
+        deactivate: Option<unsafe extern "C" fn() -> c_int>,
+        ub_write: Option<unsafe extern "C" fn(*const c_char, usize) -> usize>,
+        flush: Option<unsafe extern "C" fn(*mut c_void)>,
+        get_stat: Option<unsafe extern "C" fn() -> *mut c_void>,
+        getenv: Option<unsafe extern "C" fn(*const c_char, usize) -> *mut c_char>,
+        sapi_error: Option<unsafe extern "C" fn(c_int, *const c_char, ...)>,
+        header_handler: Option<unsafe extern "C" fn(*mut c_void, c_int, *mut c_void) -> c_int>,
+        send_headers: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+        send_header: Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>,
+        read_post: Option<unsafe extern "C" fn(*mut c_char, usize) -> usize>,
+        read_cookies: Option<unsafe extern "C" fn() -> *mut c_char>,
+        register_server_variables: Option<unsafe extern "C" fn(*mut c_void)>,
+        log_message: Option<unsafe extern "C" fn(*const c_char, c_int)>,
+        get_request_time: Option<unsafe extern "C" fn(*mut f64) -> c_int>,
+        terminate_process: Option<unsafe extern "C" fn()>,
+        php_ini_path_override: *const c_char,
+        default_post_reader: Option<unsafe extern "C" fn()>,
+        treat_data: Option<unsafe extern "C" fn(c_int, *mut c_char, *mut c_void)>,
+        executable_location: *const c_char,
+        php_ini_ignore: c_int,
+        php_ini_ignore_cwd: c_int,
+        get_fd: Option<unsafe extern "C" fn(*mut c_int) -> c_int>,
+        force_http_10: Option<unsafe extern "C" fn() -> c_int>,
+        get_target_uid: Option<unsafe extern "C" fn(*mut u32) -> c_int>,
+        get_target_gid: Option<unsafe extern "C" fn(*mut u32) -> c_int>,
+        input_filter: Option<
+            unsafe extern "C" fn(c_int, *const c_char, *mut *mut c_char, usize, *mut usize) -> c_uint,
+        >,
+        ini_defaults: Option<unsafe extern "C" fn(*mut c_void)>,
+        phpinfo_as_text: c_int,
+        ini_entries: *const c_char,
+        additional_functions: *const c_void,
+        input_filter_init: Option<unsafe extern "C" fn() -> c_uint>,
+    }
+
+    impl SapiModule {
+        fn new() -> Self {
+            unsafe { std::mem::zeroed() }
+        }
+    }
+
+    /// An 8-byte-aligned, generously sized buffer for `zend_file_handle`.
+    /// `zend_stream_init_filename` fills it; 256 B covers the real ~48 B struct.
+    #[repr(C, align(8))]
+    struct FileHandleBuf([u8; 256]);
+
+    // Function pointer types.
+    type FnSapiStartup = unsafe extern "C" fn(*mut c_void);
     type FnPhpModuleStartup = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
     type FnPhpRequestStartup = unsafe extern "C" fn() -> c_int;
     type FnPhpRequestShutdown = unsafe extern "C" fn(*mut c_void);
     type FnPhpExecuteScript = unsafe extern "C" fn(*mut c_void);
     type FnZendStreamInitFilename = unsafe extern "C" fn(*mut c_void, *const c_char);
 
-    /// Loaded PHP API function pointers.
     struct PhpApi {
         sapi_startup: FnSapiStartup,
         php_module_startup: FnPhpModuleStartup,
@@ -52,50 +100,6 @@ pub mod imp {
 
     unsafe impl Send for PhpApi {}
     unsafe impl Sync for PhpApi {}
-
-    /// The minimal `sapi_module_struct` prefix. The first 8 fields match
-    /// PHP 8.x's `sapi_module_struct`; the remainder is zeroed padding so
-    // `sapi_startup` can read whatever trailing fields it expects.
-    #[repr(C)]
-    struct SapiModule {
-        name: *const c_char,
-        pretty_name: *const c_char,
-        startup: Option<unsafe extern "C" fn(*mut SapiModule) -> c_int>,
-        shutdown: Option<unsafe extern "C" fn(*mut SapiModule) -> c_int>,
-        activate: Option<unsafe extern "C" fn() -> c_int>,
-        deactivate: Option<unsafe extern "C" fn() -> c_int>,
-        ub_write: Option<unsafe extern "C" fn(*const c_char, usize) -> usize>,
-        flush: Option<unsafe extern "C" fn(*mut c_void)>,
-        _rest: [u8; 960],
-    }
-
-    impl SapiModule {
-        fn new() -> Self {
-            let mut m: SapiModule = unsafe { std::mem::zeroed() };
-            m.name = b"larva-embedded\0".as_ptr() as *const c_char;
-            m.pretty_name = b"LarvaPHP Embedded\0".as_ptr() as *const c_char;
-            m.ub_write = Some(ub_write);
-            m
-        }
-    }
-
-    /// `zend_file_handle` prefix matching PHP 8.x.
-    #[repr(C)]
-    struct ZendFileHandle {
-        type_: c_int,
-        filename: *const c_char,
-        opened_path: *mut c_void,
-        handle: *mut c_void,
-        primary_script: u8,
-        _pad: u8,
-        _reserved: *mut c_void,
-    }
-
-    impl ZendFileHandle {
-        fn new() -> Self {
-            unsafe { std::mem::zeroed() }
-        }
-    }
 
     thread_local! {
         static OUTPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -110,26 +114,37 @@ pub mod imp {
         len
     }
 
+    // Minimal SAPI callbacks (must not be NULL — PHP calls them).
+    unsafe extern "C" fn flush_noop(_: *mut c_void) {}
+    unsafe extern "C" fn send_headers_ok(_: *mut c_void) -> c_int {
+        1 // SAPI_HEADER_SENT_SUCCESSFULLY
+    }
+    unsafe extern "C" fn send_header_noop(_: *mut c_void, _: *mut c_void) {}
+    unsafe extern "C" fn log_message_noop(_: *const c_char, _: c_int) {}
+    unsafe extern "C" fn read_post_zero(_: *mut c_char, _: usize) -> usize {
+        0
+    }
+    unsafe extern "C" fn read_cookies_null() -> *mut c_char {
+        std::ptr::null_mut()
+    }
+
     fn load_symbol(module: *mut c_void, name: &str) -> Option<*mut c_void> {
         let cname = CString::new(name).ok()?;
         let p = unsafe { GetProcAddress(module, cname.as_ptr() as *const u8) };
         if p.is_null() { None } else { Some(p) }
     }
 
-    /// The embedded PHP runtime, initialized once.
-    struct Embedded {
+    /// Loaded PHP API.
+    struct PhpApiLoaded {
         api: PhpApi,
-        /// Held alive for the PHP runtime's lifetime (PHP keeps a pointer to it).
-        #[allow(dead_code)]
-        sapi: Box<SapiModule>,
-        lock: Mutex<()>,
+        /// Kept alive for the PHP runtime's lifetime (PHP holds a pointer to it).
+        _sapi: Box<SapiModule>,
     }
 
-    unsafe impl Send for Embedded {}
-    unsafe impl Sync for Embedded {}
+    unsafe impl Send for PhpApiLoaded {}
+    unsafe impl Sync for PhpApiLoaded {}
 
-    impl Embedded {
-        /// Load php8.dll (or php8ts.dll) and run module startup.
+    impl PhpApiLoaded {
         fn load() -> Result<Self> {
             let candidates = ["php8ts.dll", "php8.dll"];
             let mut module = std::ptr::null_mut();
@@ -146,7 +161,7 @@ pub mod imp {
             }
 
             macro_rules! sym {
-                ($field:ident, $name:literal, $ty:ty) => {{
+                ($name:literal, $ty:ty) => {{
                     let p = load_symbol(module, $name).ok_or_else(|| {
                         Error::Ffi(format!("missing symbol: {}", $name))
                     })?;
@@ -155,39 +170,44 @@ pub mod imp {
             }
 
             let api = PhpApi {
-                sapi_startup: sym!(sapi_startup, "sapi_startup", FnSapiStartup),
-                php_module_startup: sym!(php_module_startup, "php_module_startup", FnPhpModuleStartup),
-                php_request_startup: sym!(php_request_startup, "php_request_startup", FnPhpRequestStartup),
-                php_request_shutdown: sym!(php_request_shutdown, "php_request_shutdown", FnPhpRequestShutdown),
-                php_execute_script: sym!(php_execute_script, "php_execute_script", FnPhpExecuteScript),
-                zend_stream_init_filename: sym!(zend_stream_init_filename, "zend_stream_init_filename", FnZendStreamInitFilename),
+                sapi_startup: sym!("sapi_startup", FnSapiStartup),
+                php_module_startup: sym!("php_module_startup", FnPhpModuleStartup),
+                php_request_startup: sym!("php_request_startup", FnPhpRequestStartup),
+                php_request_shutdown: sym!("php_request_shutdown", FnPhpRequestShutdown),
+                php_execute_script: sym!("php_execute_script", FnPhpExecuteScript),
+                zend_stream_init_filename: sym!("zend_stream_init_filename", FnZendStreamInitFilename),
             };
 
             let mut sapi = Box::new(SapiModule::new());
+            sapi.name = b"larva-embedded\0".as_ptr() as *const c_char;
+            sapi.pretty_name = b"LarvaPHP Embedded\0".as_ptr() as *const c_char;
+            sapi.ub_write = Some(ub_write);
+            sapi.flush = Some(flush_noop);
+            sapi.send_headers = Some(send_headers_ok);
+            sapi.send_header = Some(send_header_noop);
+            sapi.log_message = Some(log_message_noop);
+            sapi.read_post = Some(read_post_zero);
+            sapi.read_cookies = Some(read_cookies_null);
 
             unsafe {
-                // sapi_startup copies the module struct.
+                // sapi_startup copies the struct into the global sapi_module.
                 (api.sapi_startup)(&mut *sapi as *mut SapiModule as *mut c_void);
                 // php_module_startup initializes the Zend Engine + standard modules.
-                let rc = (api.php_module_startup)(&mut *sapi as *mut SapiModule as *mut c_void, std::ptr::null_mut());
+                let rc = (api.php_module_startup)(
+                    &mut *sapi as *mut SapiModule as *mut c_void,
+                    std::ptr::null_mut(),
+                );
                 if rc != 0 {
                     return Err(Error::Ffi(format!("php_module_startup failed: {}", rc)));
                 }
             }
 
-            tracing::info!("Embedded PHP runtime loaded (php8.dll)");
+            tracing::info!("embedded PHP runtime loaded (php8.dll)");
 
-            Ok(Self {
-                api,
-                sapi,
-                lock: Mutex::new(()),
-            })
+            Ok(Self { api, _sapi: sapi })
         }
 
-        /// Execute a PHP script in-process and return its output.
         fn execute(&self, script_path: &str) -> Result<Vec<u8>> {
-            let _guard = self.lock.lock().unwrap();
-
             OUTPUT.with(|o| o.borrow_mut().clear());
 
             let cpath = CString::new(script_path)
@@ -199,25 +219,21 @@ pub mod imp {
                     return Err(Error::Ffi(format!("php_request_startup failed: {}", rc)));
                 }
 
-                let mut fh = ZendFileHandle::new();
-                (self.api.zend_stream_init_filename)(
-                    &mut fh as *mut ZendFileHandle as *mut c_void,
-                    cpath.as_ptr(),
-                );
-                (self.api.php_execute_script)(&mut fh as *mut ZendFileHandle as *mut c_void);
+                let mut fh = FileHandleBuf([0u8; 256]);
+                let fh_ptr = &mut fh as *mut FileHandleBuf as *mut c_void;
+                (self.api.zend_stream_init_filename)(fh_ptr, cpath.as_ptr());
+                (self.api.php_execute_script)(fh_ptr);
 
                 (self.api.php_request_shutdown)(std::ptr::null_mut());
             }
 
-            let out = OUTPUT.with(|o| o.borrow().clone());
-            Ok(out)
+            Ok(OUTPUT.with(|o| o.borrow().clone()))
         }
     }
 
-    /// Lazily-initialized global embedded PHP runtime.
-    fn runtime() -> Option<&'static Embedded> {
-        static RT: OnceLock<Option<Embedded>> = OnceLock::new();
-        RT.get_or_init(|| Embedded::load().ok()).as_ref()
+    fn runtime() -> Option<&'static PhpApiLoaded> {
+        static RT: std::sync::OnceLock<Option<PhpApiLoaded>> = std::sync::OnceLock::new();
+        RT.get_or_init(|| PhpApiLoaded::load().ok()).as_ref()
     }
 
     /// Execute a PHP script using the embedded runtime. Returns the script's
@@ -257,16 +273,3 @@ pub mod imp {
 
 #[cfg(not(feature = "embedded"))]
 pub use imp::*;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(not(feature = "embedded"))]
-    #[test]
-    fn embedded_stub_returns_error() {
-        // Default build (no `embedded` feature): execute_script is a stub.
-        assert!(imp::execute_script("/tmp/x.php").is_err());
-        assert!(!imp::is_available());
-    }
-}

@@ -27,6 +27,11 @@ struct Args {
     #[arg(long = "debug")]
     debug: bool,
 
+    /// Number of runtime worker processes (0 = use CGI spawn). Enables the
+    /// 2-layer fault-isolated runtime when > 0.
+    #[arg(long = "workers", value_name = "N", default_value = "0")]
+    workers: usize,
+
     /// Generate a shell completion script and exit (bash|zsh|fish|powershell)
     #[arg(long = "completion", value_name = "SHELL")]
     completion: Option<String>,
@@ -67,6 +72,10 @@ struct Args {
     /// Hidden: run a self-test of the 2-layer runtime (spawns workers).
     #[arg(long = "runtime-demo", hide = true)]
     runtime_demo: bool,
+
+    /// Hidden: test the embedded PHP FFI executor directly on a script.
+    #[arg(long = "ffi-test", hide = true, value_name = "SCRIPT")]
+    ffi_test: Option<String>,
 }
 
 fn print_usage(out: &mut dyn std::io::Write) {
@@ -165,6 +174,31 @@ fn main() -> ExitCode {
         return runtime_demo();
     }
 
+    // Direct FFI test: execute a script via the embedded runtime.
+    if let Some(script) = &args.ffi_test {
+        tracing_subscriber::fmt::init();
+        #[cfg(feature = "embedded")]
+        {
+            println!("embedded available: {}", larva_php::embed_php::is_available());
+            match larva_php::embed_php::execute_script(script) {
+                Ok(out) => {
+                    println!("OUTPUT ({} bytes):", out.len());
+                    println!("{}", String::from_utf8_lossy(&out));
+                    return ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("FFI error: {}", e);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        #[cfg(not(feature = "embedded"))]
+        {
+            eprintln!("built without --features embedded");
+            return ExitCode::from(1);
+        }
+    }
+
     // Initialize tracing (DEBUG when --debug is set).
     if args.debug {
         use tracing::Level;
@@ -205,6 +239,17 @@ fn main() -> ExitCode {
         }
 
         server.activate();
+
+        // Optionally start the 2-layer runtime worker pool (fault-isolated PHP).
+        if args.workers > 0 {
+            match larva_php::runtime::init_pool(args.workers) {
+                Ok(()) => tracing::info!("runtime worker pool: {} workers", args.workers),
+                Err(e) => {
+                    eprintln!("Failed to start worker pool: {}", e);
+                    return ExitCode::from(1);
+                }
+            }
+        }
 
         // Start PHP main thread
         if let Err(e) = larva_php::thread::init(Vec::new()) {

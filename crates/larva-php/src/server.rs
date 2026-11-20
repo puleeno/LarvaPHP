@@ -1066,6 +1066,26 @@ fn execute_php_cgi(
     params.push(("GATEWAY_INTERFACE".into(), "CGI/1.1".into()));
     params.push(("SERVER_SOFTWARE".into(), "LarvaPHP/1.0".into()));
 
+    // Fastest path: 2-layer runtime worker pool (master → shm → worker → PHP).
+    // The master never runs PHP; a segfault in a worker is isolated and respawned.
+    if let Some(result) = crate::runtime::try_dispatch(&crate::runtime::Request {
+        method: ctx.request_method.clone(),
+        uri: ctx.request_uri.clone(),
+        headers: ctx
+            .env
+            .iter()
+            .filter_map(|(k, v)| {
+                std::str::from_utf8(k)
+                    .ok()
+                    .and_then(|ks| std::str::from_utf8(v).ok().map(|vs| (ks.to_string(), vs.to_string())))
+            })
+            .collect(),
+        body: body.to_vec(),
+        script_path: script_path.to_string(),
+    }) {
+        return result.map_err(Error::Ffi);
+    }
+
     // NOTE: embedded PHP (feature "embedded") is experimental and requires the
     // exact PHP 8.x ABI (sapi_module_struct / zend_file_handle layouts). Without
     // PHP development headers the struct layout is wrong and PHP crashes, so it
