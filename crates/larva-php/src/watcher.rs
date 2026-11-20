@@ -69,6 +69,7 @@ pub mod imp {
             self.groups.entry(dir).or_default().push(group);
         }
 
+        #[allow(dead_code)]
         fn get(&self, dir: &Path) -> Option<Vec<Arc<PatternGroup>>> {
             self.groups.get(dir).map(|v| v.clone())
         }

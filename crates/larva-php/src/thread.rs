@@ -390,6 +390,7 @@ pub struct PhpMainThread {
     pub max_threads: i32,
     pub php_ini: RwLock<std::collections::HashMap<String, String>>,
     pub is_rebooting: AtomicBool,
+    #[allow(dead_code)]
     done: crossbeam::channel::Sender<()>,
 }
 

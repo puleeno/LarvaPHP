@@ -43,6 +43,7 @@ pub struct NullMetrics;
 impl Metrics for NullMetrics {}
 
 /// Simple atomic metrics implementation.
+#[allow(dead_code)]
 pub struct AtomicMetrics {
     total_threads: AtomicI64,
     busy_threads: AtomicI64,
@@ -117,6 +118,7 @@ pub fn set_metrics(metrics: Box<dyn Metrics + Send + Sync>) {
 }
 
 /// Get metrics for internal use.
+#[allow(dead_code)]
 pub(crate) fn metrics() -> impl std::ops::Deref<Target = Box<dyn Metrics + Send + Sync>> {
     METRICS.read().unwrap()
 }

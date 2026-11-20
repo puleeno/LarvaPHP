@@ -20,6 +20,7 @@ pub struct PhpInfoTable {
 }
 
 /// Global phpinfo state.
+#[allow(dead_code)]
 pub struct PhpInfoState {
     entries: RwLock<Vec<PhpInfoEntry>>,
     dirty: RwLock<bool>,

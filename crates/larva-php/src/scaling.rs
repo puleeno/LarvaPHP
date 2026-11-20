@@ -11,15 +11,19 @@ use crate::thread::{PhpThread, ThreadState};
 use crate::worker::Worker;
 
 /// Minimum time a request must be stalled before scaling.
+#[allow(dead_code)]
 const MIN_STALL_TIME: Duration = Duration::from_millis(5);
 
 /// Time to check CPU usage before scaling.
+#[allow(dead_code)]
 const CPU_PROBE_TIME: Duration = Duration::from_millis(120);
 
 /// Maximum CPU usage for scaling (0.0 - 1.0).
+#[allow(dead_code)]
 const MAX_CPU_USAGE_FOR_SCALING: f64 = 0.8;
 
 /// Downscale check interval.
+#[allow(dead_code)]
 const DOWN_SCALE_CHECK_TIME: Duration = Duration::from_secs(5);
 
 /// Max threads to stop in one downscale iteration.

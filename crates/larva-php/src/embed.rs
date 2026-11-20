@@ -5,19 +5,23 @@
 use std::path::Path;
 
 /// Path to the embedded PHP application (empty if none).
-pub static mut EMBEDDED_APP_PATH: Option<String> = None;
+static EMBEDDED_APP_PATH: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 /// Set the embedded app path at build time.
 pub fn set_embedded_app_path(path: &str) {
-    unsafe {
-        EMBEDDED_APP_PATH = Some(path.to_string());
-    }
+    *EMBEDDED_APP_PATH.write().unwrap() = Some(path.to_string());
 }
 
 /// Get the embedded app path.
 pub fn embedded_app_path() -> Option<&'static str> {
-    unsafe {
-        EMBEDDED_APP_PATH.as_deref()
+    let guard = EMBEDDED_APP_PATH.read().unwrap();
+    if let Some(ref s) = *guard {
+        let ptr = s.as_ptr();
+        let len = s.len();
+        drop(guard);
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr as *const u8, len)).into() }
+    } else {
+        None
     }
 }
 

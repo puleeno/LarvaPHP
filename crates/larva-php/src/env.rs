@@ -125,6 +125,7 @@ pub unsafe fn register_prepared_env(
 }
 
 /// Get a CString from a string, returning null on failure.
+#[allow(dead_code)]
 pub(crate) fn to_cstring(s: &str) -> Option<CString> {
     CString::new(s).ok()
 }

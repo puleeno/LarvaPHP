@@ -27,6 +27,7 @@ pub struct LarvaPHPApp {
     pub max_requests: i32,
 
     // Internal state
+    #[allow(dead_code)]
     pub(crate) opts: RwLock<Vec<Box<dyn larva_php::options::Option>>>,
     pub(crate) provision_opts: RwLock<Vec<Box<dyn larva_php::options::Option>>>,
     pub(crate) modules: RwLock<Vec<Arc<LarvaPHPModule>>>,
@@ -97,6 +98,7 @@ impl Default for LarvaPHPApp {
     }
 }
 
+#[allow(dead_code)]
 struct WithNumThreads(i32);
 impl larva_php::options::Option for WithNumThreads {
     fn apply(&self, _opt: &mut larva_php::options::Opt) -> Result<()> {
@@ -140,9 +142,12 @@ pub struct LarvaPHPModule {
     pub request_body_timeout: Option<std::time::Duration>,
     pub name: String,
 
-    pub(crate) resolved_document_root: String,
+    #[allow(dead_code)]
+pub(crate) resolved_document_root: String,
     pub(crate) resolved_env: std::collections::HashMap<String, String>,
+    #[allow(dead_code)]
     pub(crate) server: RwLock<Option<Arc<Server>>>,
+    #[allow(dead_code)]
     pub(crate) app: RwLock<Option<Arc<LarvaPHPApp>>>,
 }
 

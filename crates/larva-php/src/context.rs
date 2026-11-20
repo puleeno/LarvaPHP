@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use crate::errors::{Error, Result};
 use crate::env::PreparedEnv;
-use crate::server::Server;
 
 /// Trait for options that configure a request.
 pub trait RequestOption: Send + Sync {
@@ -75,6 +74,7 @@ pub struct PhpContext {
 }
 
 /// Builder for creating a PhpContext.
+#[allow(dead_code)]
 pub struct PhpContextBuilder {
     ctx: PhpContext,
 }
@@ -280,6 +280,7 @@ pub fn from_message(
 mod tests {
     use super::*;
     use std::sync::Arc;
+    use crate::server::Server;
 
     fn test_server() -> Arc<Server> {
         Arc::new(Server::new("C:\\www").unwrap())

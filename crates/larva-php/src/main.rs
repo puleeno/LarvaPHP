@@ -175,7 +175,7 @@ fn main() -> ExitCode {
     }
 
     // Direct FFI test: execute a script via the embedded runtime.
-    if let Some(script) = &args.ffi_test {
+    if let Some(_script) = &args.ffi_test {
         tracing_subscriber::fmt::init();
         #[cfg(feature = "embedded")]
         {

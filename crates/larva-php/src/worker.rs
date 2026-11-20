@@ -11,6 +11,7 @@ use crate::errors::{Error, Result};
 use crate::thread::PhpThread;
 
 /// A worker script and its associated threads.
+#[allow(dead_code)]
 pub struct Worker {
     name: String,
     file_name: String,
