@@ -26,8 +26,8 @@ This document compares the feature set of LarvaPHP (Rust) against FrankenPHP (Go
 |---------|-----------|----------|-------|
 | PHP 8.2+ embedding | ✅ Via CGO | ✅ Via FFI | Both embed Zend Engine |
 | ZTS support | ✅ | ✅ | |
-| HTTP/2 support | ✅ Via Caddy | ⚠️ Hyper only (HTTP/1.1) | Hyper 1.x doesn't support HTTP/2 server |
-| HTTP/3 (QUIC) | ✅ Via Caddy | ❌ Not implemented | Requires Caddy or quinn |
+| HTTP/2 support | ✅ Via Caddy | ✅ Hyper auto::Builder (h2 + HTTP/1.1) | ALPN auto-negotiates h2/http1.1 |
+| HTTP/3 (QUIC) | ✅ Via Caddy | ✅ Via cloudflare/quiche (`--features http3`) | UDP/QUIC listener + Alt-Svc |
 | HTTPS (automatic) | ✅ Via Caddy | ❌ Not implemented | Requires Caddy |
 | CGI SAPI emulation | ✅ | ✅ | |
 | CLI script execution | ✅ `php-cli` | ✅ `execute_script_cli()` | |
@@ -147,7 +147,7 @@ This document compares the feature set of LarvaPHP (Rust) against FrankenPHP (Go
 
 ### High Priority (Core functionality) — ✅ DONE
 
-1. ✅ **HTTP/2 & HTTP/3 support** — `hyper-util auto::Builder` auto-detects HTTP/1.1 + HTTP/2 (h2c). HTTP/3 (QUIC) still future work.
+1. ✅ **HTTP/2 & HTTP/3 support** — `hyper-util auto::Builder` auto-detects HTTP/1.1 + HTTP/2 (h2c). HTTP/3 via cloudflare/quiche (`http3.rs`, `--features http3`) on a UDP/QUIC listener with Alt-Svc advertising.
 2. ✅ **Early Hints (103)** — `parse_cgi_output` detects `Status: 103`/`Link:` and surfaces preload headers.
 3. ✅ **try_files equivalent** — missing script falls back to `index.php` (front controller / permalinks).
 4. ✅ **Worker request matching** — `WorkerRouter` + `PrefixMatcher`/`RegexMatcher` (Strategy); `Server::find_worker_by_request()`.
@@ -161,6 +161,7 @@ This document compares the feature set of LarvaPHP (Rust) against FrankenPHP (Go
 - **Worker request matching** — `worker.rs` gains `WorkerRouter` (Chain of Responsibility) with `PrefixMatcher` + `RegexMatcher`; wired into the request handler.
 - **php.ini config** — `Server::set_php_ini()` + repeatable `--php-ini` CLI flag → `write_ini_overrides()` (per-process cache) → `PHP_INI_SCAN_DIR`.
 - **HTTP/2** — served by `hyper_util::server::conn::auto::Builder` (already in use).
+- **HTTP/3** — `http3.rs` runs a quiche QUIC/HTTP3 listener on UDP (same port), reusing `Server::handle_request_parts`. TCP responses advertise `Alt-Svc: h3=":PORT"`. Enabled with `--features http3 --http3`.
 
 ### Medium Priority (Developer experience) — ✅ DONE
 

@@ -31,6 +31,18 @@ struct Args {
     #[arg(long = "completion", value_name = "SHELL")]
     completion: Option<String>,
 
+    /// Enable HTTP/3 (QUIC) on the same port (UDP). Requires --features http3.
+    #[arg(long = "http3")]
+    http3: bool,
+
+    /// Path to a TLS certificate (PEM) for HTTP/3. Auto-generated if missing.
+    #[arg(long = "cert", value_name = "FILE")]
+    cert: Option<String>,
+
+    /// Path to a TLS private key (PEM) for HTTP/3. Auto-generated if missing.
+    #[arg(long = "key", value_name = "FILE")]
+    key: Option<String>,
+
     /// Show version information
     #[arg(short = 'v', long = "version")]
     version: bool,
@@ -159,6 +171,41 @@ fn main() -> ExitCode {
         if let Err(e) = larva_php::thread::init(Vec::new()) {
             eprintln!("Failed to initialize PHP runtime: {}", e);
             return ExitCode::from(1);
+        }
+
+        // Optionally start the HTTP/3 (QUIC/UDP) listener on the same port.
+        // Browsers that don't support HTTP/3 transparently keep using the TCP
+        // server (HTTP/2 / HTTP/1.1).
+        #[cfg(feature = "http3")]
+        if args.http3 {
+            let h3_addr = std::net::SocketAddr::new(addr.ip(), addr.port()).to_string();
+            let (cert, key) = match (args.cert.clone(), args.key.clone()) {
+                (Some(c), Some(k)) => (c, k),
+                _ => {
+                    let dir = std::env::temp_dir();
+                    let c = dir.join("larva-php-cert.pem").to_string_lossy().to_string();
+                    let k = dir.join("larva-php-key.pem").to_string_lossy().to_string();
+                    (c, k)
+                }
+            };
+            let server_arc = std::sync::Arc::new(larva_php::server::Server::new(&root).unwrap());
+            match larva_php::http3::ensure_cert(&cert, &key) {
+                Ok((cert, key)) => {
+                    let h3 = larva_php::http3::Http3Server::new(h3_addr.clone(), cert, key, server_arc);
+                    // Advertise HTTP/3 on TCP responses via Alt-Svc.
+                    larva_php::server::set_http3_port(addr.port());
+                    std::thread::spawn(move || {
+                        if let Err(e) = h3.run() {
+                            eprintln!("HTTP/3 server error: {}", e);
+                        }
+                    });
+                    tracing::info!("HTTP/3 (QUIC) listening on {}", h3_addr);
+                }
+                Err(e) => {
+                    eprintln!("Failed to prepare HTTP/3 certificate: {}", e);
+                    return ExitCode::from(1);
+                }
+            }
         }
 
         // Start HTTP server

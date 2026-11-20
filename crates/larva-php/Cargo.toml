@@ -32,12 +32,16 @@ clap = { workspace = true }
 regex = { workspace = true }
 tokio-util = { version = "0.7", optional = true }
 notify = { version = "6", optional = true, features = ["default"] }
+quiche = { version = "0.30", optional = true }
+rcgen = { version = "0.13", optional = true }
 
 [features]
 default = ["mercure", "watcher"]
 mercure = []
 watcher = ["notify", "tokio-util"]
 hotreload = ["mercure", "watcher"]
+http3 = ["quiche", "rcgen"]
+fcgi = []
 
 [[bin]]
 name = "larva-php"

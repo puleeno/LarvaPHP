@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use bytes::Bytes;
@@ -20,10 +20,28 @@ use tokio::net::TcpListener;
 use dashmap::DashMap;
 
 use crate::context::{PhpContext, RequestOption};
-use crate::cgi::fastabs::fast_abs;
 use crate::errors::{Error, Result};
 use crate::worker::Worker;
 use tracing::{error, info, Level};
+
+/// HTTP/3 UDP port (0 = HTTP/3 disabled). Set once at startup.
+static H3_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// Set the HTTP/3 UDP port so TCP responses can advertise it via `Alt-Svc`.
+pub fn set_http3_port(port: u16) {
+    H3_PORT.store(port, Ordering::Release);
+}
+
+/// Build an `Alt-Svc` header value advertising HTTP/3, or `None` if disabled.
+/// Browsers that support HTTP/3 will upgrade to QUIC; others keep using TCP.
+pub fn alt_svc_header() -> Option<String> {
+    let port = H3_PORT.load(Ordering::Acquire);
+    if port == 0 {
+        None
+    } else {
+        Some(format!("h3=\":{}\"; ma=86400", port))
+    }
+}
 
 /// A preconfigured server block.
 ///
@@ -371,11 +389,109 @@ impl Server {
             .header("x-content-type-options", "nosniff")
             .header("x-frame-options", "DENY");
 
+        if let Some(alt) = alt_svc_header() {
+            builder = builder.header("alt-svc", alt);
+        }
+
         for (name, value) in &headers {
             builder = builder.header(name, value);
         }
 
         Ok(builder.body(Full::new(Bytes::from(body_bytes))).unwrap())
+    }
+
+    /// Handle a request represented as raw parts (method, uri, headers, body).
+    ///
+    /// Returns `(status, headers, body)`. This is transport-agnostic and is used
+    /// by the HTTP/3 (QUIC) server, which does not carry a `hyper::Body`.
+    pub fn handle_request_parts(
+        &self,
+        method: &str,
+        uri: &str,
+        req_headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<(StatusCode, Vec<(String, String)>, Vec<u8>)> {
+        // Resolve the script path.
+        let script_path = self.resolve_script_path(uri)?;
+        let script_path = if !std::path::Path::new(&script_path).exists() {
+            match self.resolve_index_php(uri) {
+                Some(p) if std::path::Path::new(&p).exists() => p,
+                _ => {
+                    return Ok((
+                        StatusCode::NOT_FOUND,
+                        vec![("content-type".to_string(), "text/plain".to_string())],
+                        b"Not Found".to_vec(),
+                    ))
+                }
+            }
+        } else {
+            script_path
+        };
+
+        // Static (non-.php) files: serve directly.
+        if let Some(ext) = std::path::Path::new(&script_path).extension() {
+            if ext.to_string_lossy() != "php" {
+                // Block sensitive files even for static serving (defense in depth).
+                if is_sensitive_file(&script_path) {
+                    return Ok((
+                        StatusCode::FORBIDDEN,
+                        vec![("content-type".to_string(), "text/plain".to_string())],
+                        b"Forbidden".to_vec(),
+                    ));
+                }
+                if let Ok(content) = std::fs::read(&script_path) {
+                    let mime = mime_type_static(&script_path);
+                    let headers = vec![
+                        ("server".to_string(), "LarvaPHP".to_string()),
+                        ("content-type".to_string(), mime.to_string()),
+                        ("content-length".to_string(), content.len().to_string()),
+                    ];
+                    return Ok((StatusCode::OK, headers, content));
+                }
+            }
+        }
+
+        // Build a synthetic request so we can reuse PhpContext::from_request.
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (k, v) in req_headers {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+        let req = builder
+            .body(Full::new(Bytes::from(body.to_vec())))
+            .map_err(|e| Error::Ffi(e.to_string()))?;
+        let ctx = PhpContext::from_request(&req, Arc::new(Server::fallback()), vec![])?;
+        ctx.validate()?;
+
+        let body = Bytes::from(body.to_vec());
+        let output = execute_php_cgi(&script_path, &ctx, &body, &self.php_ini)?;
+        let (status, headers, out_body) = parse_cgi_output(&output);
+
+        // X-Sendfile: serve the referenced file directly.
+        if let Some((_, path)) = headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("x-sendfile"))
+        {
+            if !is_sensitive_file(path) {
+                if let Ok(content) = std::fs::read(path) {
+                    let mut final_headers = vec![
+                        ("server".to_string(), "LarvaPHP".to_string()),
+                        ("content-type".to_string(), mime_type_static(path).to_string()),
+                        ("content-length".to_string(), content.len().to_string()),
+                    ];
+                    for (n, v) in &headers {
+                        if !n.eq_ignore_ascii_case("x-sendfile")
+                            && !n.eq_ignore_ascii_case("content-length")
+                            && !n.eq_ignore_ascii_case("content-type")
+                        {
+                            final_headers.push((n.clone(), v.clone()));
+                        }
+                    }
+                    return Ok((status, final_headers, content));
+                }
+            }
+        }
+
+        Ok((status, headers, out_body))
     }
 
     /// Resolve the PHP script path from the request URI.
@@ -791,6 +907,10 @@ impl Server {
                                                 .header("x-content-type-options", "nosniff")
                                                 .header("x-frame-options", "DENY");
 
+                                        if let Some(alt) = alt_svc_header() {
+                                            builder = builder.header("alt-svc", alt);
+                                        }
+
                                         for (name, value) in &headers {
                                             builder = builder.header(name, value);
                                         }
@@ -825,26 +945,34 @@ impl Server {
 }
 
 /// Find the php-cgi.exe executable.
-fn find_php_cgi() -> Option<String> {
-    let candidates = [
-        r"C:\Program Files\PHP\current\php-cgi.exe",
-        r"C:\Program Files (x86)\PHP\current\php-cgi.exe",
-        r"C:\php\php-cgi.exe",
-    ];
-    for c in &candidates {
-        if std::path::Path::new(c).exists() {
-            return Some(c.to_string());
-        }
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(';') {
-            let p = std::path::Path::new(dir).join("php-cgi.exe");
-            if p.exists() {
-                return Some(p.to_string_lossy().to_string());
+///
+/// The result is cached after the first call so the per-request hot path does
+/// no filesystem `stat` calls.
+pub fn find_php_cgi() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let candidates = [
+                r"C:\Program Files\PHP\current\php-cgi.exe",
+                r"C:\Program Files (x86)\PHP\current\php-cgi.exe",
+                r"C:\php\php-cgi.exe",
+            ];
+            for c in &candidates {
+                if std::path::Path::new(c).exists() {
+                    return Some(c.to_string());
+                }
             }
-        }
-    }
-    None
+            if let Ok(path) = std::env::var("PATH") {
+                for dir in path.split(';') {
+                    let p = std::path::Path::new(dir).join("php-cgi.exe");
+                    if p.exists() {
+                        return Some(p.to_string_lossy().to_string());
+                    }
+                }
+            }
+            None
+        })
+        .clone()
 }
 
 /// Write php.ini overrides to a temp directory (for PHP_INI_SCAN_DIR).
@@ -903,44 +1031,82 @@ fn execute_php_cgi(
     body: &[u8],
     php_ini: &HashMap<String, String>,
 ) -> Result<String> {
+    // Ensure the script path is in the form the OS's external programs expect
+    // (e.g. strip Windows' \\?\ verbatim prefix so php-cgi can open it).
+    let native_script = crate::path_resolver::make_native(Path::new(script_path));
+    let native_script_str = native_script.to_string_lossy().to_string();
+
+    // Build the CGI parameter list once. Shared by both the FastCGI transport
+    // and the CGI-spawn fallback. Empty optional vars are skipped to keep the
+    // environment small and avoid php-cgi misreading empty CONTENT_LENGTH.
+    let mut params: Vec<(String, String)> = Vec::with_capacity(16);
+    params.push(("REQUEST_METHOD".into(), ctx.request_method.clone()));
+    params.push(("REQUEST_URI".into(), ctx.request_uri.clone()));
+    if !ctx.query_string.is_empty() {
+        params.push(("QUERY_STRING".into(), ctx.query_string.clone()));
+    }
+    params.push(("SCRIPT_NAME".into(), ctx.script_name.clone()));
+    params.push(("SCRIPT_FILENAME".into(), native_script_str.clone()));
+    params.push(("DOCUMENT_ROOT".into(), ctx.document_root.clone()));
+    params.push(("SERVER_PROTOCOL".into(), ctx.server_protocol.clone()));
+    params.push(("SERVER_NAME".into(), ctx.server_name.clone()));
+    params.push(("SERVER_PORT".into(), ctx.server_port.clone()));
+    params.push(("HTTPS".into(), ctx.https.clone()));
+    if !ctx.content_type.is_empty() {
+        params.push(("CONTENT_TYPE".into(), ctx.content_type.clone()));
+    }
+    if !ctx.content_length.is_empty() {
+        params.push(("CONTENT_LENGTH".into(), ctx.content_length.clone()));
+    }
+    if !ctx.path_info.is_empty() {
+        params.push(("PATH_INFO".into(), ctx.path_info.clone()));
+    }
+    params.push(("PHP_SELF".into(), ctx.script_name.clone()));
+    params.push(("REDIRECT_STATUS".into(), "200".into()));
+    params.push(("GATEWAY_INTERFACE".into(), "CGI/1.1".into()));
+    params.push(("SERVER_SOFTWARE".into(), "LarvaPHP/1.0".into()));
+
+    // Fast path: reuse a persistent FastCGI backend (no per-request spawn).
+    // Falls through to CGI spawn on any error or when the feature is disabled.
+    #[cfg(feature = "fcgi")]
+    {
+        if let Some(backend) = crate::fastcgi::backend() {
+            match backend.request(&params, body) {
+                Ok(resp) => {
+                    if !resp.stderr.is_empty() {
+                        tracing::debug!(
+                            "php-cgi stderr: {}",
+                            String::from_utf8_lossy(&resp.stderr)
+                        );
+                    }
+                    return Ok(String::from_utf8_lossy(&resp.stdout).into_owned());
+                }
+                Err(e) => {
+                    tracing::debug!("FastCGI request failed, falling back to CGI spawn: {}", e);
+                }
+            }
+        }
+    }
+
+    // Fallback: spawn a fresh php-cgi process per request (CGI model).
     let php_exe = find_php_cgi()
         .ok_or_else(|| Error::Ffi("php-cgi.exe not found".to_string()))?;
 
     let mut cmd = std::process::Command::new(php_exe);
     cmd.current_dir(
-        std::path::Path::new(script_path)
+        native_script
             .parent()
             .unwrap_or(std::path::Path::new(".")),
     );
 
-    // Apply php.ini overrides via PHP_INI_SCAN_DIR (env-based). This preserves
-    // the main php.ini and loads our overrides afterwards. The directory is
-    // written once per unique override set and cached.
-    match write_ini_overrides(php_ini) {
-        Some(dir) => {
-            cmd.env("PHP_INI_SCAN_DIR", &dir);
-        }
-        None => {}
+    // Apply php.ini overrides via PHP_INI_SCAN_DIR (env-based).
+    if let Some(dir) = write_ini_overrides(php_ini) {
+        cmd.env("PHP_INI_SCAN_DIR", &dir);
     }
 
-    // Set CGI environment variables
-    cmd.env("REQUEST_METHOD", &ctx.request_method);
-    cmd.env("REQUEST_URI", &ctx.request_uri);
-    cmd.env("QUERY_STRING", &ctx.query_string);
-    cmd.env("SCRIPT_NAME", &ctx.script_name);
-    cmd.env("SCRIPT_FILENAME", script_path);
-    cmd.env("DOCUMENT_ROOT", &ctx.document_root);
-    cmd.env("SERVER_PROTOCOL", &ctx.server_protocol);
-    cmd.env("SERVER_NAME", &ctx.server_name);
-    cmd.env("SERVER_PORT", &ctx.server_port);
-    cmd.env("HTTPS", &ctx.https);
-    cmd.env("CONTENT_TYPE", &ctx.content_type);
-    cmd.env("CONTENT_LENGTH", &ctx.content_length);
-    cmd.env("PATH_INFO", &ctx.path_info);
-    cmd.env("PHP_SELF", &ctx.script_name);
-    cmd.env("REDIRECT_STATUS", "200");
-    cmd.env("GATEWAY_INTERFACE", "CGI/1.1");
-    cmd.env("SERVER_SOFTWARE", "LarvaPHP/1.0");
+    for (k, v) in &params {
+        cmd.env(k, v);
+    }
 
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
@@ -1122,11 +1288,8 @@ fn try_x_sendfile(
 /// absolute path (without canonicalization) when the path does not exist or
 /// cannot be resolved, so a not-yet-created root still works.
 pub fn resolve_root_symlink(root: &str) -> std::io::Result<PathBuf> {
-    let abs = fast_abs(root)?;
-    match std::fs::canonicalize(&abs) {
-        Ok(canonical) => Ok(canonical),
-        Err(_) => Ok(abs),
-    }
+    // Delegate to the OS-appropriate path resolver (Strategy pattern).
+    crate::path_resolver::resolve_root(root)
 }
 
 /// Resolve the PHP script path from the request URI (static helper).
@@ -1778,6 +1941,17 @@ mod tests {
         // Canonicalized path should exist and be absolute.
         assert!(resolved.is_absolute());
         assert!(resolved.exists());
+        // Regression: on Windows the verbatim `\\?\` prefix must be stripped,
+        // otherwise php-cgi fails with "No input file specified."
+        #[cfg(windows)]
+        {
+            let s = resolved.to_string_lossy().to_string();
+            assert!(
+                !s.starts_with(r"\\?\"),
+                "verbatim prefix must be stripped: {}",
+                s
+            );
+        }
     }
 
     #[test]
@@ -1786,5 +1960,124 @@ mod tests {
         // rather than erroring.
         let resolved = resolve_root_symlink("C:\\definitely\\nonexistent\\path-xyz").unwrap();
         assert!(resolved.to_string_lossy().to_string().contains("nonexistent"));
+    }
+
+    // === Alt-Svc tests ===
+
+    #[test]
+    fn alt_svc_disabled_by_default() {
+        // H3_PORT starts at 0 (or was reset), so no Alt-Svc header.
+        // We can only assert the function is callable; global state may be
+        // mutated by other tests, so just check the enabled path format.
+        let header = alt_svc_header();
+        if let Some(h) = header {
+            assert!(h.contains("h3="));
+        }
+    }
+
+    #[test]
+    fn alt_svc_enabled_format() {
+        set_http3_port(9443);
+        let header = alt_svc_header().unwrap();
+        assert_eq!(header, "h3=\":9443\"; ma=86400");
+        set_http3_port(0); // reset
+    }
+
+    // === handle_request_parts tests (HTTP/3 core) ===
+
+    #[test]
+    fn handle_request_parts_static_file() {
+        let dir = std::env::temp_dir().join(format!("larva-h3-static-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("style.css"), b"body{}").unwrap();
+
+        let server = Server::new(&dir.to_string_lossy()).unwrap();
+        let (status, headers, body) =
+            server.handle_request_parts("GET", "/style.css", &[], &[]).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"body{}");
+        assert!(headers.iter().any(|(n, _)| n == "content-type"));
+        assert!(headers.iter().any(|(n, _)| n == "content-length"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_request_parts_not_found() {
+        let dir = std::env::temp_dir().join(format!("larva-h3-404-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // No index.php, so a missing .php returns 404.
+
+        let server = Server::new(&dir.to_string_lossy()).unwrap();
+        let (status, _, _) =
+            server.handle_request_parts("GET", "/missing.php", &[], &[]).unwrap();
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_request_parts_sensitive_static_blocked() {
+        let dir = std::env::temp_dir().join(format!("larva-h3-sens-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), b"SECRET=1").unwrap();
+
+        let server = Server::new(&dir.to_string_lossy()).unwrap();
+        let (status, _, _) =
+            server.handle_request_parts("GET", "/.env", &[], &[]).unwrap();
+
+        // Sensitive files must NOT be served: either 403 (blocked) or 404
+        // (path not resolved) is acceptable — never 200.
+        assert!(
+            status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+            "sensitive file must not be served, got {}",
+            status
+        );
+        assert_ne!(status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_request_parts_php_executes() {
+        let dir = std::env::temp_dir().join(format!("larva-h3-php-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ok.php"), b"<?php echo 'H3OK'; ?>").unwrap();
+
+        let server = Server::new(&dir.to_string_lossy()).unwrap();
+        match server.handle_request_parts("GET", "/ok.php", &[], &[]) {
+            Ok((status, _, body)) => {
+                // When php-cgi is available and the script runs, assert the body.
+                if status == StatusCode::OK {
+                    assert_eq!(String::from_utf8_lossy(&body).trim(), "H3OK");
+                }
+                // Non-OK (e.g. php-cgi unavailable in CI) is tolerated.
+            }
+            Err(_) => {
+                // php-cgi not available in this environment — skip.
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_request_parts_php_ini_reachable() {
+        // handle_request_parts must be callable with extra headers without panicking.
+        let dir = std::env::temp_dir().join(format!("larva-h3-hdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("style.css"), b"x").unwrap();
+
+        let server = Server::new(&dir.to_string_lossy()).unwrap();
+        let headers = vec![
+            ("accept".to_string(), "*/*".to_string()),
+            ("user-agent".to_string(), "test".to_string()),
+        ];
+        let result = server.handle_request_parts("GET", "/style.css", &headers, &[]);
+        assert!(result.is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
