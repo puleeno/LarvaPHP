@@ -31,6 +31,7 @@ pub mod context;
 pub mod embed;
 pub mod env;
 pub mod errors;
+pub mod fastcgi;
 pub mod http3;
 pub mod metrics;
 pub mod options;

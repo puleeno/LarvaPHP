@@ -41,6 +41,7 @@ mercure = []
 watcher = ["notify", "tokio-util"]
 hotreload = ["mercure", "watcher"]
 http3 = ["quiche", "rcgen"]
+fcgi = []
 
 [[bin]]
 name = "larva-php"

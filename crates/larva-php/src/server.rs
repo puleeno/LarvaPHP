@@ -945,7 +945,7 @@ impl Server {
 }
 
 /// Find the php-cgi.exe executable.
-fn find_php_cgi() -> Option<String> {
+pub fn find_php_cgi() -> Option<String> {
     let candidates = [
         r"C:\Program Files\PHP\current\php-cgi.exe",
         r"C:\Program Files (x86)\PHP\current\php-cgi.exe",
@@ -1023,13 +1023,66 @@ fn execute_php_cgi(
     body: &[u8],
     php_ini: &HashMap<String, String>,
 ) -> Result<String> {
-    let php_exe = find_php_cgi()
-        .ok_or_else(|| Error::Ffi("php-cgi.exe not found".to_string()))?;
-
     // Ensure the script path is in the form the OS's external programs expect
     // (e.g. strip Windows' \\?\ verbatim prefix so php-cgi can open it).
     let native_script = crate::path_resolver::make_native(Path::new(script_path));
     let native_script_str = native_script.to_string_lossy().to_string();
+
+    // Build the CGI parameter list once. Shared by both the FastCGI transport
+    // and the CGI-spawn fallback. Empty optional vars are skipped to keep the
+    // environment small and avoid php-cgi misreading empty CONTENT_LENGTH.
+    let mut params: Vec<(String, String)> = Vec::with_capacity(16);
+    params.push(("REQUEST_METHOD".into(), ctx.request_method.clone()));
+    params.push(("REQUEST_URI".into(), ctx.request_uri.clone()));
+    if !ctx.query_string.is_empty() {
+        params.push(("QUERY_STRING".into(), ctx.query_string.clone()));
+    }
+    params.push(("SCRIPT_NAME".into(), ctx.script_name.clone()));
+    params.push(("SCRIPT_FILENAME".into(), native_script_str.clone()));
+    params.push(("DOCUMENT_ROOT".into(), ctx.document_root.clone()));
+    params.push(("SERVER_PROTOCOL".into(), ctx.server_protocol.clone()));
+    params.push(("SERVER_NAME".into(), ctx.server_name.clone()));
+    params.push(("SERVER_PORT".into(), ctx.server_port.clone()));
+    params.push(("HTTPS".into(), ctx.https.clone()));
+    if !ctx.content_type.is_empty() {
+        params.push(("CONTENT_TYPE".into(), ctx.content_type.clone()));
+    }
+    if !ctx.content_length.is_empty() {
+        params.push(("CONTENT_LENGTH".into(), ctx.content_length.clone()));
+    }
+    if !ctx.path_info.is_empty() {
+        params.push(("PATH_INFO".into(), ctx.path_info.clone()));
+    }
+    params.push(("PHP_SELF".into(), ctx.script_name.clone()));
+    params.push(("REDIRECT_STATUS".into(), "200".into()));
+    params.push(("GATEWAY_INTERFACE".into(), "CGI/1.1".into()));
+    params.push(("SERVER_SOFTWARE".into(), "LarvaPHP/1.0".into()));
+
+    // Fast path: reuse a persistent FastCGI backend (no per-request spawn).
+    // Falls through to CGI spawn on any error or when the feature is disabled.
+    #[cfg(feature = "fcgi")]
+    {
+        if let Some(backend) = crate::fastcgi::backend() {
+            match backend.request(&params, body) {
+                Ok(resp) => {
+                    if !resp.stderr.is_empty() {
+                        tracing::debug!(
+                            "php-cgi stderr: {}",
+                            String::from_utf8_lossy(&resp.stderr)
+                        );
+                    }
+                    return Ok(String::from_utf8_lossy(&resp.stdout).into_owned());
+                }
+                Err(e) => {
+                    tracing::debug!("FastCGI request failed, falling back to CGI spawn: {}", e);
+                }
+            }
+        }
+    }
+
+    // Fallback: spawn a fresh php-cgi process per request (CGI model).
+    let php_exe = find_php_cgi()
+        .ok_or_else(|| Error::Ffi("php-cgi.exe not found".to_string()))?;
 
     let mut cmd = std::process::Command::new(php_exe);
     cmd.current_dir(
@@ -1038,44 +1091,14 @@ fn execute_php_cgi(
             .unwrap_or(std::path::Path::new(".")),
     );
 
-    // Apply php.ini overrides via PHP_INI_SCAN_DIR (env-based). This preserves
-    // the main php.ini and loads our overrides afterwards. The directory is
-    // written once per unique override set and cached.
-    match write_ini_overrides(php_ini) {
-        Some(dir) => {
-            cmd.env("PHP_INI_SCAN_DIR", &dir);
-        }
-        None => {}
+    // Apply php.ini overrides via PHP_INI_SCAN_DIR (env-based).
+    if let Some(dir) = write_ini_overrides(php_ini) {
+        cmd.env("PHP_INI_SCAN_DIR", &dir);
     }
 
-    // Set CGI environment variables. Empty optional vars are skipped to keep
-    // the environment block small and avoid php-cgi misreading empty
-    // CONTENT_LENGTH/CONTENT_TYPE (which can trigger stdin reads).
-    cmd.env("REQUEST_METHOD", &ctx.request_method);
-    cmd.env("REQUEST_URI", &ctx.request_uri);
-    if !ctx.query_string.is_empty() {
-        cmd.env("QUERY_STRING", &ctx.query_string);
+    for (k, v) in &params {
+        cmd.env(k, v);
     }
-    cmd.env("SCRIPT_NAME", &ctx.script_name);
-    cmd.env("SCRIPT_FILENAME", &native_script_str);
-    cmd.env("DOCUMENT_ROOT", &ctx.document_root);
-    cmd.env("SERVER_PROTOCOL", &ctx.server_protocol);
-    cmd.env("SERVER_NAME", &ctx.server_name);
-    cmd.env("SERVER_PORT", &ctx.server_port);
-    cmd.env("HTTPS", &ctx.https);
-    if !ctx.content_type.is_empty() {
-        cmd.env("CONTENT_TYPE", &ctx.content_type);
-    }
-    if !ctx.content_length.is_empty() {
-        cmd.env("CONTENT_LENGTH", &ctx.content_length);
-    }
-    if !ctx.path_info.is_empty() {
-        cmd.env("PATH_INFO", &ctx.path_info);
-    }
-    cmd.env("PHP_SELF", &ctx.script_name);
-    cmd.env("REDIRECT_STATUS", "200");
-    cmd.env("GATEWAY_INTERFACE", "CGI/1.1");
-    cmd.env("SERVER_SOFTWARE", "LarvaPHP/1.0");
 
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
