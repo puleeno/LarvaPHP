@@ -1245,7 +1245,20 @@ fn try_x_sendfile(
 pub fn resolve_root_symlink(root: &str) -> std::io::Result<PathBuf> {
     let abs = fast_abs(root)?;
     match std::fs::canonicalize(&abs) {
-        Ok(canonical) => Ok(canonical),
+        Ok(canonical) => {
+            // On Windows, canonicalize() returns a verbatim `\\?\C:\...` path.
+            // Rust handles it, but many Win32 programs (e.g. php-cgi.exe) do
+            // not, failing with "No input file specified." Strip the verbatim
+            // prefix so the path is a plain Win32 path.
+            #[cfg(windows)]
+            {
+                let s = canonical.to_string_lossy();
+                if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                    return Ok(PathBuf::from(stripped));
+                }
+            }
+            Ok(canonical)
+        }
         Err(_) => Ok(abs),
     }
 }
@@ -1899,6 +1912,17 @@ mod tests {
         // Canonicalized path should exist and be absolute.
         assert!(resolved.is_absolute());
         assert!(resolved.exists());
+        // Regression: on Windows the verbatim `\\?\` prefix must be stripped,
+        // otherwise php-cgi fails with "No input file specified."
+        #[cfg(windows)]
+        {
+            let s = resolved.to_string_lossy().to_string();
+            assert!(
+                !s.starts_with(r"\\?\"),
+                "verbatim prefix must be stripped: {}",
+                s
+            );
+        }
     }
 
     #[test]
