@@ -62,24 +62,49 @@ larva-php/
 
 ### Build
 
-```powershell
-# Set up MSVC environment (required on Windows)
-$env:PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64;$env:PATH"
-$env:INCLUDE = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include;C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt;$env:INCLUDE"
-$env:LIB = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\lib\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64;$env:LIB"
+**Windows (recommended):** use `build.ps1`, which auto-configures the MSVC
+environment (finds Visual Studio via vswhere, enters the x64 dev shell) and runs
+cargo with your arguments:
 
+```powershell
+.\build.ps1 --release                     # release build
+.\build.ps1 --features embedded           # with HTTP/3 + embedded PHP FFI
+.\build.ps1 test --lib                    # run tests
+```
+
+**Manual (any platform):** ensure the MSVC toolchain is in PATH (run from a
+"Developer PowerShell for VS 2022" or set `PATH`/`INCLUDE`/`LIB`), then:
+
+```powershell
 cargo build --release
 ```
 
 ### Serve a PHP Application
 
 ```powershell
-# Serve from a directory (CLI --root format)
+# Default (CGI spawn per request)
 .\target\release\larva-php.exe --root C:\path\to\php-app --addr 127.0.0.1:8000
+
+# 2-layer fault-isolated runtime (embedded PHP in worker processes, ~10x faster)
+.\build.ps1 --release --features embedded
+.\target\release\larva-php.exe --root C:\path\to\php-app --workers 4 --addr 127.0.0.1:8000
 
 # Run a PHP script directly
 .\target\release\larva-php.exe script.php arg1 arg2
 ```
+
+### Transport modes
+
+| Mode | Command | PHP runs in | Speed |
+|------|---------|-------------|-------|
+| CGI (default) | `--root app` | php-cgi.exe spawn/request | ~85 ms |
+| FastCGI | `--features fcgi` | php-cgi -b | ~80 ms (Windows) |
+| **2-layer (FFI)** | `--features embedded --workers N` | **worker process (in-process)** | **~8 ms** |
+
+The 2-layer mode is a LiteSpeed-style architecture: the master (Rust/Hyper)
+handles HTTP and never runs PHP; N worker child processes each embed PHP via
+FFI. A segfault in a worker is isolated and respawned by the master. See
+[`docs/runtime-architecture.md`](docs/runtime-architecture.md).
 
 ### Test with WordPress
 
