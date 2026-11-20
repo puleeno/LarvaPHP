@@ -1,7 +1,68 @@
 use std::env;
 use std::path::PathBuf;
 
+/// On Windows, ensure the MSVC environment (cl.exe, INCLUDE, LIB) is set up so
+/// `cargo build` works from a plain shell. If cl.exe is already in PATH, this is
+/// a no-op. Otherwise it locates Visual Studio via vswhere and imports the
+/// environment by running vcvars64.bat.
+#[cfg(windows)]
+fn ensure_msvc_env() {
+    // Already configured?
+    let has_cl = env::var("PATH")
+        .map(|p| p.split(';').any(|d| PathBuf::from(d).join("cl.exe").exists()))
+        .unwrap_or(false);
+    if has_cl && env::var("INCLUDE").is_ok() {
+        return;
+    }
+
+    let vswhere = PathBuf::from(
+        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe",
+    );
+    if !vswhere.exists() {
+        return; // No VS installer; let cc emit a clear error.
+    }
+
+    let vs_path = std::process::Command::new(&vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if vs_path.is_empty() {
+        return;
+    }
+
+    let vcvars = PathBuf::from(&vs_path).join(r"VC\Auxiliary\Build\vcvars64.bat");
+    if !vcvars.exists() {
+        return;
+    }
+
+    // `cmd /c "vcvars64.bat && set"` prints the resulting environment.
+    if let Ok(out) = std::process::Command::new("cmd")
+        .args(["/c", &format!("\"{}\" && set", vcvars.display())])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                env::set_var(k, v);
+            }
+        }
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    ensure_msvc_env();
+
     // ---- PHP library directory ----
     let php_lib_dir = PathBuf::from(env::var("PHP_LIB_DIR").unwrap_or_else(|_| {
         r"C:\Program Files\PHP\current\dev".to_string()
@@ -67,7 +128,9 @@ fn main() {
         build.define("WIN32", None);
         build.define("_CRT_SECURE_NO_WARNINGS", None);
         build.define("_CRT_NONSTDC_NO_DEPRECATE", None);
-        build.compiler("cl.exe");
+        // Do NOT force build.compiler("cl.exe"): that bypasses the cc crate's
+        // vswhere-based MSVC detection and fails in shells without the MSVC env.
+        // cc auto-detects cl.exe via vswhere and sets up INCLUDE/LIB itself.
     }
 
     build.compile("larva_php_bridge");

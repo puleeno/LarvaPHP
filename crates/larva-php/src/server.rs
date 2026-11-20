@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 use dashmap::DashMap;
 
 use crate::context::{PhpContext, RequestOption};
+use crate::env::PreparedEnv;
 use crate::errors::{Error, Result};
 use crate::worker::Worker;
 use tracing::{error, info, Level};
@@ -685,23 +686,6 @@ impl Server {
                                     );
                                 }
 
-                                // Rate limiting check
-                                let allowed = rate_limiter.check(&client_ip);
-                                if !allowed {
-                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(
-                                        Response::builder()
-                                            .status(StatusCode::TOO_MANY_REQUESTS)
-                                            .header("content-type", "text/plain; charset=UTF-8")
-                                            .header(
-                                                "retry-after",
-                                                rate_limiter.config.window_secs.to_string(),
-                                            )
-                                            .header("server", "LarvaPHP")
-                                            .body(Full::new(Bytes::from("Too Many Requests")))
-                                            .unwrap(),
-                                    );
-                                }
-
                                 let uri = req.uri().to_string();
 
                                 // Worker request matching (Strategy: first matcher wins).
@@ -726,15 +710,32 @@ impl Server {
                                     // try_files fallback: if the resolved path doesn't
                                     // exist (or is a directory without index), fall back
                                     // to index.php (front controller / permalink support).
-                                    if let Some(ref p) = resolved {
-                                        if std::path::Path::new(p).exists() {
-                                            resolved
-                                        } else {
-                                            resolve_index_php_static(&uri, &root)
-                                        }
-                                    } else {
-                                        resolve_index_php_static(&uri, &root)
-                                    }
+                                    // Static assets (.ico, .css, .js, images) that don't
+                                    // exist return 404 instead (no front-controller
+                        // fallback), which avoids WordPress building wrong redirect URLs
+                        // like /favicon.ico/wp-admin/install.php.
+                        if let Some(ref p) = resolved {
+                            if std::path::Path::new(p).exists() {
+                                resolved
+                            } else {
+                                let is_static = std::path::Path::new(p)
+                                    .extension()
+                                    .map(|e| e.to_string_lossy() != "php")
+                                    .unwrap_or(false);
+                                if is_static {
+                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                        Response::builder()
+                                            .status(StatusCode::NOT_FOUND)
+                                            .header("server", "LarvaPHP")
+                                            .body(Full::new(Bytes::from("Not Found")))
+                                            .unwrap(),
+                                    );
+                                }
+                                resolve_index_php_static(&uri, &root)
+                            }
+                        } else {
+                            resolve_index_php_static(&uri, &root)
+                        }
                                 };
 
                                 let Some(path) = script_path else {
@@ -791,6 +792,26 @@ impl Server {
                                     }
                                 }
 
+                                // Rate limiting: only PHP requests count (static files
+                                // are served above and don't consume the quota). This
+                                // prevents asset-heavy pages (e.g. wp-admin) from
+                                // hitting the limit from CSS/JS/image requests.
+                                let allowed = rate_limiter.check(&client_ip);
+                                if !allowed {
+                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                        Response::builder()
+                                            .status(StatusCode::TOO_MANY_REQUESTS)
+                                            .header("content-type", "text/plain; charset=UTF-8")
+                                            .header(
+                                                "retry-after",
+                                                rate_limiter.config.window_secs.to_string(),
+                                            )
+                                            .header("server", "LarvaPHP")
+                                            .body(Full::new(Bytes::from("Too Many Requests")))
+                                            .unwrap(),
+                                    );
+                                }
+
                                 // Build minimal CGI context for environment variables
                                 let rel = path.trim_start_matches(&root);
                                 let rel = rel.trim_start_matches('\\').trim_start_matches('/');
@@ -804,7 +825,16 @@ impl Server {
                                     ctx: tokio::sync::watch::channel(None).1,
                                     document_root: root.clone(),
                                     split_path: split_path.clone(),
-                                    env: Default::default(),
+                                    env: {
+                                        let mut e = PreparedEnv::new();
+                                        for (k, v) in req.headers() {
+                                            e.insert(
+                                                k.as_str().to_string().into_bytes(),
+                                                v.to_str().unwrap_or_default().to_string().into_bytes(),
+                                            );
+                                        }
+                                        e
+                                    },
                                     logger: Level::INFO,
                                     worker: None,
                                     server: Arc::new(Server::fallback()),
@@ -1045,7 +1075,18 @@ fn execute_php_cgi(
     if !ctx.query_string.is_empty() {
         params.push(("QUERY_STRING".into(), ctx.query_string.clone()));
     }
-    params.push(("SCRIPT_NAME".into(), ctx.script_name.clone()));
+    // SCRIPT_NAME must reflect the ACTUAL script (e.g. /index.php when the
+    // request fell back to the front controller), not the original URI. This
+    // lets WordPress build correct URLs/redirects (e.g. /wp-admin/install.php).
+    let script_name = std::path::Path::new(&native_script_str)
+        .strip_prefix(&ctx.document_root)
+        .ok()
+        .and_then(|rel| {
+            let s = rel.to_string_lossy().replace('\\', "/");
+            if s.is_empty() { None } else { Some(format!("/{}", s)) }
+        })
+        .unwrap_or_else(|| ctx.script_name.clone());
+    params.push(("SCRIPT_NAME".into(), script_name.clone()));
     params.push(("SCRIPT_FILENAME".into(), native_script_str.clone()));
     params.push(("DOCUMENT_ROOT".into(), ctx.document_root.clone()));
     params.push(("SERVER_PROTOCOL".into(), ctx.server_protocol.clone()));
@@ -1058,13 +1099,94 @@ fn execute_php_cgi(
     if !ctx.content_length.is_empty() {
         params.push(("CONTENT_LENGTH".into(), ctx.content_length.clone()));
     }
-    if !ctx.path_info.is_empty() {
-        params.push(("PATH_INFO".into(), ctx.path_info.clone()));
-    }
-    params.push(("PHP_SELF".into(), ctx.script_name.clone()));
+    params.push(("PHP_SELF".into(), script_name.clone()));
     params.push(("REDIRECT_STATUS".into(), "200".into()));
     params.push(("GATEWAY_INTERFACE".into(), "CGI/1.1".into()));
     params.push(("SERVER_SOFTWARE".into(), "LarvaPHP/1.0".into()));
+    // HTTP_HOST (Host header) so WordPress/URLs resolve to the right host.
+    let http_host = if ctx.server_port.is_empty()
+        || ctx.server_port == "80"
+        || ctx.server_port == "443"
+    {
+        ctx.server_name.clone()
+    } else {
+        format!("{}:{}", ctx.server_name, ctx.server_port)
+    };
+params.push(("HTTP_HOST".into(), http_host.clone()));
+
+    // Forward the Cookie header as HTTP_COOKIE so PHP ($_COOKIE) and
+    // WordPress (which checks $_COOKIE[TEST_COOKIE]) see the session cookie.
+    if let Some(cookie) = ctx
+        .env
+        .iter()
+        .find_map(|(k, v)| {
+            let ks = std::str::from_utf8(k).ok()?;
+            if ks.eq_ignore_ascii_case("Cookie") {
+                std::str::from_utf8(v).ok().map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+    {
+        params.push(("HTTP_COOKIE".into(), cookie));
+    }
+
+    // Fastest path: 2-layer runtime worker pool (master → shm → worker → PHP).
+    // The master never runs PHP; a segfault in a worker is isolated and respawned.
+    {
+        let mut req_headers: Vec<(String, String)> = ctx
+            .env
+            .iter()
+            .filter_map(|(k, v)| {
+                std::str::from_utf8(k)
+                    .ok()
+                    .and_then(|ks| std::str::from_utf8(v).ok().map(|vs| (ks.to_string(), vs.to_string())))
+            })
+            .collect();
+        // Forward POST metadata so the worker's php-cgi reads the request body.
+        if !ctx.content_length.is_empty() {
+            req_headers.push(("CONTENT_LENGTH".to_string(), ctx.content_length.clone()));
+        } else if !body.is_empty() {
+            req_headers.push(("CONTENT_LENGTH".to_string(), body.len().to_string()));
+        }
+        if !ctx.content_type.is_empty() {
+            req_headers.push(("CONTENT_TYPE".to_string(), ctx.content_type.clone()));
+        }
+        // HTTP_HOST so the worker's php-cgi resolves the correct host.
+        req_headers.push(("HTTP_HOST".to_string(), http_host.clone()));
+        // Forward Cookie as HTTP_COOKIE so PHP ($_COOKIE) and WordPress see it.
+        if let Some(cookie) = ctx
+            .env
+            .iter()
+            .find_map(|(k, v)| {
+                let ks = std::str::from_utf8(k).ok()?;
+                if ks.eq_ignore_ascii_case("Cookie") {
+                    std::str::from_utf8(v).ok().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+        {
+            req_headers.push(("HTTP_COOKIE".to_string(), cookie));
+        }
+        if let Some(result) = crate::runtime::try_dispatch(&crate::runtime::Request {
+            method: ctx.request_method.clone(),
+            uri: ctx.request_uri.clone(),
+            headers: req_headers,
+            body: body.to_vec(),
+            script_path: script_path.to_string(),
+            server_name: ctx.server_name.clone(),
+            server_port: ctx.server_port.clone(),
+            script_name: script_name.clone(),
+        }) {
+            return result.map_err(Error::Ffi);
+        }
+    }
+
+    // NOTE: embedded PHP (feature "embedded") is experimental and requires the
+    // exact PHP 8.x ABI (sapi_module_struct / zend_file_handle layouts). Without
+    // PHP development headers the struct layout is wrong and PHP crashes, so it
+    // is NOT auto-invoked here. See embed_php.rs for details.
 
     // Fast path: reuse a persistent FastCGI backend (no per-request spawn).
     // Falls through to CGI spawn on any error or when the feature is disabled.
