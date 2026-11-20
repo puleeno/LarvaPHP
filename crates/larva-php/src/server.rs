@@ -1048,10 +1048,14 @@ fn execute_php_cgi(
         None => {}
     }
 
-    // Set CGI environment variables
+    // Set CGI environment variables. Empty optional vars are skipped to keep
+    // the environment block small and avoid php-cgi misreading empty
+    // CONTENT_LENGTH/CONTENT_TYPE (which can trigger stdin reads).
     cmd.env("REQUEST_METHOD", &ctx.request_method);
     cmd.env("REQUEST_URI", &ctx.request_uri);
-    cmd.env("QUERY_STRING", &ctx.query_string);
+    if !ctx.query_string.is_empty() {
+        cmd.env("QUERY_STRING", &ctx.query_string);
+    }
     cmd.env("SCRIPT_NAME", &ctx.script_name);
     cmd.env("SCRIPT_FILENAME", &native_script_str);
     cmd.env("DOCUMENT_ROOT", &ctx.document_root);
@@ -1059,9 +1063,15 @@ fn execute_php_cgi(
     cmd.env("SERVER_NAME", &ctx.server_name);
     cmd.env("SERVER_PORT", &ctx.server_port);
     cmd.env("HTTPS", &ctx.https);
-    cmd.env("CONTENT_TYPE", &ctx.content_type);
-    cmd.env("CONTENT_LENGTH", &ctx.content_length);
-    cmd.env("PATH_INFO", &ctx.path_info);
+    if !ctx.content_type.is_empty() {
+        cmd.env("CONTENT_TYPE", &ctx.content_type);
+    }
+    if !ctx.content_length.is_empty() {
+        cmd.env("CONTENT_LENGTH", &ctx.content_length);
+    }
+    if !ctx.path_info.is_empty() {
+        cmd.env("PATH_INFO", &ctx.path_info);
+    }
     cmd.env("PHP_SELF", &ctx.script_name);
     cmd.env("REDIRECT_STATUS", "200");
     cmd.env("GATEWAY_INTERFACE", "CGI/1.1");
