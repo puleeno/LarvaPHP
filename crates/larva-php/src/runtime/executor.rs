@@ -14,7 +14,6 @@ pub struct Request {
     pub method: String,
     pub uri: String,
     pub headers: Vec<(String, String)>,
-    #[serde(with = "serde_bytes")]
     pub body: Vec<u8>,
     pub script_path: String,
 }
@@ -24,21 +23,7 @@ pub struct Request {
 pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    #[serde(with = "serde_bytes")]
     pub body: Vec<u8>,
-}
-
-/// Minimal serde_bytes-like module (avoids an extra dependency).
-mod serde_bytes {
-    use serde::{Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_bytes(bytes)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        <Vec<u8> as serde::Deserialize>::deserialize(d)
-    }
 }
 
 /// Trait for a PHP executor (embedded FFI, FastCGI client, or mock).
@@ -98,9 +83,24 @@ impl PhpExecutor for CgiExecutor {
         cmd.env("SCRIPT_NAME", &req.uri);
         cmd.env("REDIRECT_STATUS", "200");
         cmd.env("GATEWAY_INTERFACE", "CGI/1.1");
+        let mut has_content_length = false;
+        let mut has_content_type = false;
         for (k, v) in &req.headers {
-            cmd.env(k, v);
+            if k.eq_ignore_ascii_case("CONTENT_LENGTH") || k.eq_ignore_ascii_case("HTTP_CONTENT_LENGTH") {
+                cmd.env("CONTENT_LENGTH", v);
+                has_content_length = true;
+            } else if k.eq_ignore_ascii_case("CONTENT_TYPE") || k.eq_ignore_ascii_case("HTTP_CONTENT_TYPE") {
+                cmd.env("CONTENT_TYPE", v);
+                has_content_type = true;
+            } else {
+                cmd.env(k, v);
+            }
         }
+        // Fallback: derive from the body if the master didn't forward them.
+        if !has_content_length && !req.body.is_empty() {
+            cmd.env("CONTENT_LENGTH", req.body.len().to_string());
+        }
+        let _ = has_content_type;
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());

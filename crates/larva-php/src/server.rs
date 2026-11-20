@@ -1068,10 +1068,8 @@ fn execute_php_cgi(
 
     // Fastest path: 2-layer runtime worker pool (master → shm → worker → PHP).
     // The master never runs PHP; a segfault in a worker is isolated and respawned.
-    if let Some(result) = crate::runtime::try_dispatch(&crate::runtime::Request {
-        method: ctx.request_method.clone(),
-        uri: ctx.request_uri.clone(),
-        headers: ctx
+    {
+        let mut req_headers: Vec<(String, String)> = ctx
             .env
             .iter()
             .filter_map(|(k, v)| {
@@ -1079,11 +1077,25 @@ fn execute_php_cgi(
                     .ok()
                     .and_then(|ks| std::str::from_utf8(v).ok().map(|vs| (ks.to_string(), vs.to_string())))
             })
-            .collect(),
-        body: body.to_vec(),
-        script_path: script_path.to_string(),
-    }) {
-        return result.map_err(Error::Ffi);
+            .collect();
+        // Forward POST metadata so the worker's php-cgi reads the request body.
+        if !ctx.content_length.is_empty() {
+            req_headers.push(("CONTENT_LENGTH".to_string(), ctx.content_length.clone()));
+        } else if !body.is_empty() {
+            req_headers.push(("CONTENT_LENGTH".to_string(), body.len().to_string()));
+        }
+        if !ctx.content_type.is_empty() {
+            req_headers.push(("CONTENT_TYPE".to_string(), ctx.content_type.clone()));
+        }
+        if let Some(result) = crate::runtime::try_dispatch(&crate::runtime::Request {
+            method: ctx.request_method.clone(),
+            uri: ctx.request_uri.clone(),
+            headers: req_headers,
+            body: body.to_vec(),
+            script_path: script_path.to_string(),
+        }) {
+            return result.map_err(Error::Ffi);
+        }
     }
 
     // NOTE: embedded PHP (feature "embedded") is experimental and requires the
