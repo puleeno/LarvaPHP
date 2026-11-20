@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 use dashmap::DashMap;
 
 use crate::context::{PhpContext, RequestOption};
+use crate::env::PreparedEnv;
 use crate::errors::{Error, Result};
 use crate::worker::Worker;
 use tracing::{error, info, Level};
@@ -824,7 +825,16 @@ impl Server {
                                     ctx: tokio::sync::watch::channel(None).1,
                                     document_root: root.clone(),
                                     split_path: split_path.clone(),
-                                    env: Default::default(),
+                                    env: {
+                                        let mut e = PreparedEnv::new();
+                                        for (k, v) in req.headers() {
+                                            e.insert(
+                                                k.as_str().to_string().into_bytes(),
+                                                v.to_str().unwrap_or_default().to_string().into_bytes(),
+                                            );
+                                        }
+                                        e
+                                    },
                                     logger: Level::INFO,
                                     worker: None,
                                     server: Arc::new(Server::fallback()),
@@ -1102,7 +1112,24 @@ fn execute_php_cgi(
     } else {
         format!("{}:{}", ctx.server_name, ctx.server_port)
     };
-    params.push(("HTTP_HOST".into(), http_host.clone()));
+params.push(("HTTP_HOST".into(), http_host.clone()));
+
+    // Forward the Cookie header as HTTP_COOKIE so PHP ($_COOKIE) and
+    // WordPress (which checks $_COOKIE[TEST_COOKIE]) see the session cookie.
+    if let Some(cookie) = ctx
+        .env
+        .iter()
+        .find_map(|(k, v)| {
+            let ks = std::str::from_utf8(k).ok()?;
+            if ks.eq_ignore_ascii_case("Cookie") {
+                std::str::from_utf8(v).ok().map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+    {
+        params.push(("HTTP_COOKIE".into(), cookie));
+    }
 
     // Fastest path: 2-layer runtime worker pool (master → shm → worker → PHP).
     // The master never runs PHP; a segfault in a worker is isolated and respawned.
@@ -1127,6 +1154,21 @@ fn execute_php_cgi(
         }
         // HTTP_HOST so the worker's php-cgi resolves the correct host.
         req_headers.push(("HTTP_HOST".to_string(), http_host.clone()));
+        // Forward Cookie as HTTP_COOKIE so PHP ($_COOKIE) and WordPress see it.
+        if let Some(cookie) = ctx
+            .env
+            .iter()
+            .find_map(|(k, v)| {
+                let ks = std::str::from_utf8(k).ok()?;
+                if ks.eq_ignore_ascii_case("Cookie") {
+                    std::str::from_utf8(v).ok().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+        {
+            req_headers.push(("HTTP_COOKIE".to_string(), cookie));
+        }
         if let Some(result) = crate::runtime::try_dispatch(&crate::runtime::Request {
             method: ctx.request_method.clone(),
             uri: ctx.request_uri.clone(),

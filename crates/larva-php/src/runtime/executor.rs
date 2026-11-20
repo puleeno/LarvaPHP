@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::cgi;
+
 /// A single PHP request: raw CGI-style fields (already UTF-8/bytes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -101,15 +103,28 @@ impl PhpExecutor for CgiExecutor {
         let mut has_content_length = false;
         let mut has_content_type = false;
         for (k, v) in &req.headers {
-            if k.eq_ignore_ascii_case("CONTENT_LENGTH") || k.eq_ignore_ascii_case("HTTP_CONTENT_LENGTH") {
-                cmd.env("CONTENT_LENGTH", v);
+            // CGI SAPI only populates $_SERVER for variables prefixed with HTTP_.
+            // Convert header names (e.g. "Cookie", "X-Real-IP") to "HTTP_COOKIE".
+            let env_name = if k.eq_ignore_ascii_case("CONTENT_LENGTH")
+                || k.eq_ignore_ascii_case("HTTP_CONTENT_LENGTH")
+            {
                 has_content_length = true;
-            } else if k.eq_ignore_ascii_case("CONTENT_TYPE") || k.eq_ignore_ascii_case("HTTP_CONTENT_TYPE") {
-                cmd.env("CONTENT_TYPE", v);
+                "CONTENT_LENGTH".to_string()
+            } else if k.eq_ignore_ascii_case("CONTENT_TYPE")
+                || k.eq_ignore_ascii_case("HTTP_CONTENT_TYPE")
+            {
                 has_content_type = true;
+                "CONTENT_TYPE".to_string()
+            } else if k.eq_ignore_ascii_case("Cookie") {
+                "HTTP_COOKIE".to_string()
+            } else if k.eq_ignore_ascii_case("HTTP_COOKIE") {
+                "HTTP_COOKIE".to_string()
+            } else if k.starts_with("HTTP_") {
+                k.clone()
             } else {
-                cmd.env(k, v);
-            }
+                cgi::header_name(k)
+            };
+            cmd.env(&env_name, v);
         }
         // Fallback: derive from the body if the master didn't forward them.
         if !has_content_length && !req.body.is_empty() {

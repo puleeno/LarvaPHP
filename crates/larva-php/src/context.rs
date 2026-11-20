@@ -151,6 +151,14 @@ impl PhpContext {
             handler_return: None,
         };
 
+        // Forward all request headers as HTTP_* CGI variables so PHP ($_SERVER)
+        // and WordPress (cookie/session checks) see them.
+        for (k, v) in request.headers() {
+            let key = k.as_str().to_string().into_bytes();
+            let val = v.to_str().unwrap_or_default().to_string().into_bytes();
+            ctx.env.insert(key, val);
+        }
+
         for opt in &opts {
             opt.apply(&mut ctx)?;
         }
