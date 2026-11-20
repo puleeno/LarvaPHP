@@ -162,6 +162,7 @@ This document compares the feature set of LarvaPHP (Rust) against FrankenPHP (Go
 - **php.ini config** — `Server::set_php_ini()` + repeatable `--php-ini` CLI flag → `write_ini_overrides()` (per-process cache) → `PHP_INI_SCAN_DIR`.
 - **HTTP/2** — served by `hyper_util::server::conn::auto::Builder` (already in use).
 - **HTTP/3** — `http3.rs` runs a quiche QUIC/HTTP3 listener on UDP (same port), reusing `Server::handle_request_parts`. TCP responses advertise `Alt-Svc: h3=":PORT"`. Enabled with `--features http3 --http3`.
+- **2-layer runtime (LiteSpeed-style)** — `runtime/` module: master (Tokio/Hyper) + worker process pool (N children) with shared-memory IPC. `execute_php_cgi` dispatches to the pool when `--workers N`. Worker executors: `CgiExecutor` (default, loads php.ini + extensions like mysqli) or `FfiExecutor` (opt-in via `LARVA_PHP_EXECUTOR=ffi`, ~8ms). `php_ini.rs` resolves php.ini via Strategy+Chain (EnvResolver/PathResolver/IniEntriesResolver/ChainResolver). See `runtime-architecture.md`.
 
 ### Medium Priority (Developer experience) — ✅ DONE
 
