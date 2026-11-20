@@ -355,6 +355,11 @@ impl Server {
         // Parse CGI output: headers + optional blank line + body
         let (status_code, headers, body_bytes) = parse_cgi_output(&output);
 
+        // X-Sendfile: serve the referenced file directly.
+        if let Some(resp) = try_x_sendfile(&headers, status_code) {
+            return Ok(resp);
+        }
+
         let mut builder = Response::builder()
             .status(status_code)
             .header("server", "LarvaPHP")
@@ -765,6 +770,15 @@ impl Server {
                                         let (status_code, headers, body_bytes) =
                                             parse_cgi_output(&output);
 
+                                        // X-Sendfile: serve the referenced file
+                                        // directly (efficient large-file serving).
+                                        if let Some(resp) = try_x_sendfile(&headers, status_code)
+                                        {
+                                            return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                                resp,
+                                            );
+                                        }
+
                                         let mut builder =
                                             Response::builder()
                                                 .status(status_code)
@@ -1050,6 +1064,51 @@ fn parse_cgi_output(output: &str) -> (StatusCode, Vec<(String, String)>, Vec<u8>
     }
 
     (status_code, headers, body_bytes)
+}
+
+/// Attempt to serve an `X-Sendfile` response.
+///
+/// If the CGI output carries an `X-Sendfile` header pointing to a readable,
+/// non-sensitive file, the server streams that file directly (efficient for
+/// large files) instead of the (usually empty) PHP output body. CGI headers are
+/// preserved except `X-Sendfile` and body-related headers, which are recomputed.
+fn try_x_sendfile(
+    headers: &[(String, String)],
+    status_code: StatusCode,
+) -> Option<Response<Full<Bytes>>> {
+    let xsendfile = headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("x-sendfile"))?;
+    let file_path = xsendfile.1.trim();
+
+    // Refuse sensitive files even if PHP asks for them.
+    if is_sensitive_file(file_path) {
+        return None;
+    }
+
+    let content = std::fs::read(file_path).ok()?;
+    let mime = mime_type_static(file_path);
+
+    let mut builder = Response::builder()
+        .status(status_code)
+        .header("server", "LarvaPHP")
+        .header("x-content-type-options", "nosniff")
+        .header("x-frame-options", "DENY")
+        .header("content-type", mime)
+        .header("content-length", content.len().to_string())
+        .header("accept-ranges", "bytes");
+
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("x-sendfile")
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("content-type")
+        {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+
+    Some(builder.body(Full::new(Bytes::from(content))).unwrap())
 }
 
 /// Resolve the PHP script path from the request URI (static helper).
@@ -1641,5 +1700,54 @@ mod tests {
     fn http_date_epoch() {
         let date = http_date(0);
         assert_eq!(date, "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    // === X-Sendfile tests ===
+
+    #[test]
+    fn x_sendfile_serves_file() {
+        let dir = std::env::temp_dir().join(format!("larva-xsendfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("data.bin");
+        std::fs::write(&file, b"file-content-here").unwrap();
+
+        let headers = vec![
+            ("X-Sendfile".to_string(), file.to_string_lossy().to_string()),
+            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+        ];
+        let resp = try_x_sendfile(&headers, StatusCode::OK);
+        assert!(resp.is_some());
+        let resp = resp.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-length").unwrap(),
+            "17"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn x_sendfile_absent_returns_none() {
+        let headers = vec![("Content-Type".to_string(), "text/html".to_string())];
+        assert!(try_x_sendfile(&headers, StatusCode::OK).is_none());
+    }
+
+    #[test]
+    fn x_sendfile_missing_file_returns_none() {
+        let headers = vec![(
+            "X-Sendfile".to_string(),
+            "C:\\nonexistent\\nope.bin".to_string(),
+        )];
+        assert!(try_x_sendfile(&headers, StatusCode::OK).is_none());
+    }
+
+    #[test]
+    fn x_sendfile_blocks_sensitive_file() {
+        let headers = vec![(
+            "X-Sendfile".to_string(),
+            "C:/www/.env".to_string(),
+        )];
+        assert!(try_x_sendfile(&headers, StatusCode::OK).is_none());
     }
 }

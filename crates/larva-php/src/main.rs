@@ -23,6 +23,14 @@ struct Args {
     #[arg(long = "php-ini", value_name = "KEY=VALUE")]
     php_ini: Vec<String>,
 
+    /// Enable debug logging (verbose output)
+    #[arg(long = "debug")]
+    debug: bool,
+
+    /// Generate a shell completion script and exit (bash|zsh|fish|powershell)
+    #[arg(long = "completion", value_name = "SHELL")]
+    completion: Option<String>,
+
     /// Show version information
     #[arg(short = 'v', long = "version")]
     version: bool,
@@ -32,18 +40,40 @@ struct Args {
     help: bool,
 }
 
+fn print_usage(out: &mut dyn std::io::Write) {
+    let _ = writeln!(
+        out,
+        "LarvaPHP {} - a modern PHP application server",
+        VERSION
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Usage:");
+    let _ = writeln!(
+        out,
+        "  larva-php <script.php> [args...]    Run a PHP script"
+    );
+    let _ = writeln!(
+        out,
+        "  larva-php --root <dir>              Serve PHP application from directory"
+    );
+    let _ = writeln!(
+        out,
+        "  larva-php --php-ini key=value       Set a php.ini directive (repeatable)"
+    );
+    let _ = writeln!(out, "  larva-php --debug                   Enable debug logging");
+    let _ = writeln!(
+        out,
+        "  larva-php --completion <shell>      Generate shell completion (bash|zsh|fish|powershell)"
+    );
+    let _ = writeln!(out, "  larva-php --version                 Show version");
+    let _ = writeln!(out, "  larva-php --help                    Show this help");
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
 
     if args.help {
-        println!("LarvaPHP {} - a modern PHP application server", VERSION);
-        println!();
-        println!("Usage:");
-        println!("  larva-php <script.php> [args...]    Run a PHP script");
-        println!("  larva-php -root <dir>               Serve PHP application from directory");
-        println!("  larva-php --php-ini key=value       Set a php.ini directive (repeatable)");
-        println!("  larva-php --version                 Show version");
-        println!("  larva-php --help                    Show this help");
+        print_usage(&mut std::io::stdout());
         return ExitCode::SUCCESS;
     }
 
@@ -59,8 +89,40 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Shell completion generation (exits early).
+    if let Some(shell_name) = &args.completion {
+        let bin = std::env::args()
+            .next()
+            .and_then(|p| {
+                std::path::Path::new(&p)
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "larva-php".to_string());
+        match larva_php::Shell::from_name(shell_name) {
+            Some(shell) => {
+                shell.write_to(&bin, &mut std::io::stdout()).ok();
+                return ExitCode::SUCCESS;
+            }
+            None => {
+                eprintln!(
+                    "Unsupported shell '{}'. Supported: bash, zsh, fish, powershell",
+                    shell_name
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // Initialize tracing (DEBUG when --debug is set).
+    if args.debug {
+        use tracing::Level;
+        tracing_subscriber::fmt()
+            .with_max_level(Level::DEBUG)
+            .init();
+    } else {
+        tracing_subscriber::fmt::init();
+    }
 
     if let Some(root) = args.root {
         let addr: std::net::SocketAddr = match args.addr.parse() {
@@ -114,13 +176,7 @@ fn main() -> ExitCode {
         let status = larva_php::execute_script_cli(&script, &script_args, Vec::new());
         ExitCode::from(status as u8)
     } else {
-        eprintln!("LarvaPHP {} - a modern PHP application server", VERSION);
-        eprintln!();
-        eprintln!("Usage:");
-        eprintln!("  larva-php <script.php> [args...]    Run a PHP script");
-        eprintln!("  larva-php -root <dir>               Serve PHP application from directory");
-        eprintln!("  larva-php --version                 Show version");
-        eprintln!("  larva-php --help                    Show this help");
+        print_usage(&mut std::io::stderr());
         ExitCode::from(1)
     }
 }
