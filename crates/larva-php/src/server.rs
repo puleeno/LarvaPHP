@@ -685,23 +685,6 @@ impl Server {
                                     );
                                 }
 
-                                // Rate limiting check
-                                let allowed = rate_limiter.check(&client_ip);
-                                if !allowed {
-                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(
-                                        Response::builder()
-                                            .status(StatusCode::TOO_MANY_REQUESTS)
-                                            .header("content-type", "text/plain; charset=UTF-8")
-                                            .header(
-                                                "retry-after",
-                                                rate_limiter.config.window_secs.to_string(),
-                                            )
-                                            .header("server", "LarvaPHP")
-                                            .body(Full::new(Bytes::from("Too Many Requests")))
-                                            .unwrap(),
-                                    );
-                                }
-
                                 let uri = req.uri().to_string();
 
                                 // Worker request matching (Strategy: first matcher wins).
@@ -789,6 +772,26 @@ impl Server {
                                                 .unwrap(),
                                         );
                                     }
+                                }
+
+                                // Rate limiting: only PHP requests count (static files
+                                // are served above and don't consume the quota). This
+                                // prevents asset-heavy pages (e.g. wp-admin) from
+                                // hitting the limit from CSS/JS/image requests.
+                                let allowed = rate_limiter.check(&client_ip);
+                                if !allowed {
+                                    return Ok::<Response<Full<Bytes>>, hyper::Error>(
+                                        Response::builder()
+                                            .status(StatusCode::TOO_MANY_REQUESTS)
+                                            .header("content-type", "text/plain; charset=UTF-8")
+                                            .header(
+                                                "retry-after",
+                                                rate_limiter.config.window_secs.to_string(),
+                                            )
+                                            .header("server", "LarvaPHP")
+                                            .body(Full::new(Bytes::from("Too Many Requests")))
+                                            .unwrap(),
+                                    );
                                 }
 
                                 // Build minimal CGI context for environment variables
