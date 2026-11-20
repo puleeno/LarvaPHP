@@ -20,7 +20,6 @@ use tokio::net::TcpListener;
 use dashmap::DashMap;
 
 use crate::context::{PhpContext, RequestOption};
-use crate::cgi::fastabs::fast_abs;
 use crate::errors::{Error, Result};
 use crate::worker::Worker;
 use tracing::{error, info, Level};
@@ -1027,9 +1026,14 @@ fn execute_php_cgi(
     let php_exe = find_php_cgi()
         .ok_or_else(|| Error::Ffi("php-cgi.exe not found".to_string()))?;
 
+    // Ensure the script path is in the form the OS's external programs expect
+    // (e.g. strip Windows' \\?\ verbatim prefix so php-cgi can open it).
+    let native_script = crate::path_resolver::make_native(Path::new(script_path));
+    let native_script_str = native_script.to_string_lossy().to_string();
+
     let mut cmd = std::process::Command::new(php_exe);
     cmd.current_dir(
-        std::path::Path::new(script_path)
+        native_script
             .parent()
             .unwrap_or(std::path::Path::new(".")),
     );
@@ -1049,7 +1053,7 @@ fn execute_php_cgi(
     cmd.env("REQUEST_URI", &ctx.request_uri);
     cmd.env("QUERY_STRING", &ctx.query_string);
     cmd.env("SCRIPT_NAME", &ctx.script_name);
-    cmd.env("SCRIPT_FILENAME", script_path);
+    cmd.env("SCRIPT_FILENAME", &native_script_str);
     cmd.env("DOCUMENT_ROOT", &ctx.document_root);
     cmd.env("SERVER_PROTOCOL", &ctx.server_protocol);
     cmd.env("SERVER_NAME", &ctx.server_name);
@@ -1243,24 +1247,8 @@ fn try_x_sendfile(
 /// absolute path (without canonicalization) when the path does not exist or
 /// cannot be resolved, so a not-yet-created root still works.
 pub fn resolve_root_symlink(root: &str) -> std::io::Result<PathBuf> {
-    let abs = fast_abs(root)?;
-    match std::fs::canonicalize(&abs) {
-        Ok(canonical) => {
-            // On Windows, canonicalize() returns a verbatim `\\?\C:\...` path.
-            // Rust handles it, but many Win32 programs (e.g. php-cgi.exe) do
-            // not, failing with "No input file specified." Strip the verbatim
-            // prefix so the path is a plain Win32 path.
-            #[cfg(windows)]
-            {
-                let s = canonical.to_string_lossy();
-                if let Some(stripped) = s.strip_prefix(r"\\?\") {
-                    return Ok(PathBuf::from(stripped));
-                }
-            }
-            Ok(canonical)
-        }
-        Err(_) => Ok(abs),
-    }
+    // Delegate to the OS-appropriate path resolver (Strategy pattern).
+    crate::path_resolver::resolve_root(root)
 }
 
 /// Resolve the PHP script path from the request URI (static helper).

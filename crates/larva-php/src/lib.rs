@@ -34,6 +34,7 @@ pub mod errors;
 pub mod http3;
 pub mod metrics;
 pub mod options;
+pub mod path_resolver;
 pub mod phpinfo;
 pub mod scaling;
 pub mod server;
@@ -55,6 +56,10 @@ pub use config::{
 pub use completions::Shell;
 pub use errors::{Error, Result};
 pub use options::{Option, WorkerOption, ServerOption, RequestOption};
+pub use path_resolver::{
+    default_resolver, make_native, resolve_root, PathResolver, UnixPathResolver,
+    WindowsPathResolver,
+};
 pub use server::Server;
 
 pub use larva_php_sys as ffi;
