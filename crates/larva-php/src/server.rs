@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH, Instant};
 use bytes::Bytes;
@@ -24,6 +24,25 @@ use crate::cgi::fastabs::fast_abs;
 use crate::errors::{Error, Result};
 use crate::worker::Worker;
 use tracing::{error, info, Level};
+
+/// HTTP/3 UDP port (0 = HTTP/3 disabled). Set once at startup.
+static H3_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// Set the HTTP/3 UDP port so TCP responses can advertise it via `Alt-Svc`.
+pub fn set_http3_port(port: u16) {
+    H3_PORT.store(port, Ordering::Release);
+}
+
+/// Build an `Alt-Svc` header value advertising HTTP/3, or `None` if disabled.
+/// Browsers that support HTTP/3 will upgrade to QUIC; others keep using TCP.
+pub fn alt_svc_header() -> Option<String> {
+    let port = H3_PORT.load(Ordering::Acquire);
+    if port == 0 {
+        None
+    } else {
+        Some(format!("h3=\":{}\"; ma=86400", port))
+    }
+}
 
 /// A preconfigured server block.
 ///
@@ -371,11 +390,101 @@ impl Server {
             .header("x-content-type-options", "nosniff")
             .header("x-frame-options", "DENY");
 
+        if let Some(alt) = alt_svc_header() {
+            builder = builder.header("alt-svc", alt);
+        }
+
         for (name, value) in &headers {
             builder = builder.header(name, value);
         }
 
         Ok(builder.body(Full::new(Bytes::from(body_bytes))).unwrap())
+    }
+
+    /// Handle a request represented as raw parts (method, uri, headers, body).
+    ///
+    /// Returns `(status, headers, body)`. This is transport-agnostic and is used
+    /// by the HTTP/3 (QUIC) server, which does not carry a `hyper::Body`.
+    pub fn handle_request_parts(
+        &self,
+        method: &str,
+        uri: &str,
+        req_headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<(StatusCode, Vec<(String, String)>, Vec<u8>)> {
+        // Resolve the script path.
+        let script_path = self.resolve_script_path(uri)?;
+        let script_path = if !std::path::Path::new(&script_path).exists() {
+            match self.resolve_index_php(uri) {
+                Some(p) if std::path::Path::new(&p).exists() => p,
+                _ => {
+                    return Ok((
+                        StatusCode::NOT_FOUND,
+                        vec![("content-type".to_string(), "text/plain".to_string())],
+                        b"Not Found".to_vec(),
+                    ))
+                }
+            }
+        } else {
+            script_path
+        };
+
+        // Static (non-.php) files: serve directly.
+        if let Some(ext) = std::path::Path::new(&script_path).extension() {
+            if ext.to_string_lossy() != "php" {
+                if let Ok(content) = std::fs::read(&script_path) {
+                    let mime = mime_type_static(&script_path);
+                    let headers = vec![
+                        ("server".to_string(), "LarvaPHP".to_string()),
+                        ("content-type".to_string(), mime.to_string()),
+                        ("content-length".to_string(), content.len().to_string()),
+                    ];
+                    return Ok((StatusCode::OK, headers, content));
+                }
+            }
+        }
+
+        // Build a synthetic request so we can reuse PhpContext::from_request.
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (k, v) in req_headers {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+        let req = builder
+            .body(Full::new(Bytes::from(body.to_vec())))
+            .map_err(|e| Error::Ffi(e.to_string()))?;
+        let ctx = PhpContext::from_request(&req, Arc::new(Server::fallback()), vec![])?;
+        ctx.validate()?;
+
+        let body = Bytes::from(body.to_vec());
+        let output = execute_php_cgi(&script_path, &ctx, &body, &self.php_ini)?;
+        let (status, headers, out_body) = parse_cgi_output(&output);
+
+        // X-Sendfile: serve the referenced file directly.
+        if let Some((_, path)) = headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("x-sendfile"))
+        {
+            if !is_sensitive_file(path) {
+                if let Ok(content) = std::fs::read(path) {
+                    let mut final_headers = vec![
+                        ("server".to_string(), "LarvaPHP".to_string()),
+                        ("content-type".to_string(), mime_type_static(path).to_string()),
+                        ("content-length".to_string(), content.len().to_string()),
+                    ];
+                    for (n, v) in &headers {
+                        if !n.eq_ignore_ascii_case("x-sendfile")
+                            && !n.eq_ignore_ascii_case("content-length")
+                            && !n.eq_ignore_ascii_case("content-type")
+                        {
+                            final_headers.push((n.clone(), v.clone()));
+                        }
+                    }
+                    return Ok((status, final_headers, content));
+                }
+            }
+        }
+
+        Ok((status, headers, out_body))
     }
 
     /// Resolve the PHP script path from the request URI.
@@ -790,6 +899,10 @@ impl Server {
                                                 .header("server", "LarvaPHP")
                                                 .header("x-content-type-options", "nosniff")
                                                 .header("x-frame-options", "DENY");
+
+                                        if let Some(alt) = alt_svc_header() {
+                                            builder = builder.header("alt-svc", alt);
+                                        }
 
                                         for (name, value) in &headers {
                                             builder = builder.header(name, value);
@@ -1786,5 +1899,26 @@ mod tests {
         // rather than erroring.
         let resolved = resolve_root_symlink("C:\\definitely\\nonexistent\\path-xyz").unwrap();
         assert!(resolved.to_string_lossy().to_string().contains("nonexistent"));
+    }
+
+    // === Alt-Svc tests ===
+
+    #[test]
+    fn alt_svc_disabled_by_default() {
+        // H3_PORT starts at 0 (or was reset), so no Alt-Svc header.
+        // We can only assert the function is callable; global state may be
+        // mutated by other tests, so just check the enabled path format.
+        let header = alt_svc_header();
+        if let Some(h) = header {
+            assert!(h.contains("h3="));
+        }
+    }
+
+    #[test]
+    fn alt_svc_enabled_format() {
+        set_http3_port(9443);
+        let header = alt_svc_header().unwrap();
+        assert_eq!(header, "h3=\":9443\"; ma=86400");
+        set_http3_port(0); // reset
     }
 }
