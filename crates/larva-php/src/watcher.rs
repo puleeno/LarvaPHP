@@ -221,6 +221,16 @@ pub mod imp {
                         for group in watcher.matching_groups(dir) {
                             (group.callback)(evts);
                         }
+                        // Worker auto-restart: restart workers whose backing
+                        // script file was created or modified.
+                        for evt in evts {
+                            if matches!(
+                                evt.effect_type,
+                                FileEffect::Update | FileEffect::Create
+                            ) {
+                                crate::worker::restart_workers_for_file(&evt.path);
+                            }
+                        }
                     }
                     debounce_timer = None;
                 }

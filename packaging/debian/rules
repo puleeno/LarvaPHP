@@ -1,0 +1,15 @@
+#!/usr/bin/make -f
+# debian/rules for larva-php
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release -p larva-php --bin larva-php
+
+override_dh_auto_test:
+	cargo test --lib
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/larva-php \
+		debian/larva-php/usr/bin/larva-php
