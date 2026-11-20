@@ -13,6 +13,7 @@ pub mod imp {
     use std::io::{self, Read, Write};
     use std::net::{SocketAddr, TcpStream};
     use std::process::{Child, Command};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
@@ -83,25 +84,19 @@ pub mod imp {
         pub stderr: Vec<u8>,
     }
 
-    /// Send one FastCGI request to `addr` and collect the response.
-    pub fn fastcgi_request(
-        addr: &SocketAddr,
+    /// Send one FastCGI request on an existing connection and collect the response.
+    fn fastcgi_request_on(
+        stream: &mut TcpStream,
+        req_id: u16,
         params: &[(String, String)],
         body: &[u8],
     ) -> io::Result<FastCgiResponse> {
-        let mut stream = TcpStream::connect(addr)?;
-        stream.set_read_timeout(Some(Duration::from_secs(120)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-        stream.set_nodelay(true)?;
-
-        let req_id = 1u16;
-
         // BEGIN_REQUEST (role = RESPONDER, flags = 0)
         let mut begin = Vec::with_capacity(8);
         begin.extend_from_slice(&FCG_RESPONDER.to_be_bytes());
         begin.push(0);
         begin.extend_from_slice(&[0u8; 6]);
-        write_record(&mut stream, FCG_BEGIN_REQUEST, req_id, &begin)?;
+        write_record(stream, FCG_BEGIN_REQUEST, req_id, &begin)?;
 
         // PARAMS
         let mut params_data = Vec::new();
@@ -109,21 +104,21 @@ pub mod imp {
             encode_name_value(&mut params_data, k, v);
         }
         for chunk in params_data.chunks(MAX_CONTENT) {
-            write_record(&mut stream, FCG_PARAMS, req_id, chunk)?;
+            write_record(stream, FCG_PARAMS, req_id, chunk)?;
         }
-        write_record(&mut stream, FCG_PARAMS, req_id, &[])?; // end of PARAMS
+        write_record(stream, FCG_PARAMS, req_id, &[])?; // end of PARAMS
 
         // STDIN
         for chunk in body.chunks(MAX_CONTENT) {
-            write_record(&mut stream, FCG_STDIN, req_id, chunk)?;
+            write_record(stream, FCG_STDIN, req_id, chunk)?;
         }
-        write_record(&mut stream, FCG_STDIN, req_id, &[])?; // end of STDIN
+        write_record(stream, FCG_STDIN, req_id, &[])?; // end of STDIN
 
         // Read the response.
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         loop {
-            let rec = read_record(&mut stream)?;
+            let rec = read_record(stream)?;
             match rec.type_ {
                 FCG_STDOUT => stdout.extend_from_slice(&rec.content),
                 FCG_STDERR => stderr.extend_from_slice(&rec.content),
@@ -135,10 +130,25 @@ pub mod imp {
         Ok(FastCgiResponse { stdout, stderr })
     }
 
+    /// Send one FastCGI request to `addr` and collect the response (new connection).
+    pub fn fastcgi_request(
+        addr: &SocketAddr,
+        params: &[(String, String)],
+        body: &[u8],
+    ) -> io::Result<FastCgiResponse> {
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        stream.set_nodelay(true)?;
+        fastcgi_request_on(&mut stream, 1, params, body)
+    }
+
     /// A persistent FastCGI backend (`php-cgi -b`) shared across requests.
     pub struct FastCgiServer {
         child: Mutex<Option<Child>>,
         addr: SocketAddr,
+        pool: Mutex<Vec<TcpStream>>,
+        req_counter: std::sync::atomic::AtomicU16,
     }
 
     impl FastCgiServer {
@@ -178,6 +188,8 @@ pub mod imp {
             Ok(Self {
                 child: Mutex::new(Some(child)),
                 addr,
+                pool: Mutex::new(Vec::new()),
+                req_counter: std::sync::atomic::AtomicU16::new(1),
             })
         }
 
@@ -185,13 +197,37 @@ pub mod imp {
             self.addr
         }
 
-        /// Execute a request against the persistent backend.
+        /// Execute a request against the persistent backend, reusing a pooled
+        /// connection when possible (avoids a TCP handshake per request).
         pub fn request(
             &self,
             params: &[(String, String)],
             body: &[u8],
         ) -> io::Result<FastCgiResponse> {
-            fastcgi_request(&self.addr, params, body)
+            // Reuse an idle connection or establish a new one.
+            let mut stream = self.pool.lock().unwrap().pop();
+            let mut stream = match stream.take() {
+                Some(s) => s,
+                None => TcpStream::connect(&self.addr)?,
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+            let _ = stream.set_nodelay(true);
+
+            // Unique request id (wraps at u16; 0 is reserved).
+            let mut req_id = self.req_counter.fetch_add(1, Ordering::Relaxed);
+            if req_id == 0 {
+                req_id = 1;
+            }
+
+            match fastcgi_request_on(&mut stream, req_id, params, body) {
+                Ok(resp) => {
+                    // Connection still healthy: return it to the pool.
+                    self.pool.lock().unwrap().push(stream);
+                    Ok(resp)
+                }
+                Err(e) => Err(e), // broken connection is dropped
+            }
         }
     }
 

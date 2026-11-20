@@ -945,26 +945,34 @@ impl Server {
 }
 
 /// Find the php-cgi.exe executable.
+///
+/// The result is cached after the first call so the per-request hot path does
+/// no filesystem `stat` calls.
 pub fn find_php_cgi() -> Option<String> {
-    let candidates = [
-        r"C:\Program Files\PHP\current\php-cgi.exe",
-        r"C:\Program Files (x86)\PHP\current\php-cgi.exe",
-        r"C:\php\php-cgi.exe",
-    ];
-    for c in &candidates {
-        if std::path::Path::new(c).exists() {
-            return Some(c.to_string());
-        }
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(';') {
-            let p = std::path::Path::new(dir).join("php-cgi.exe");
-            if p.exists() {
-                return Some(p.to_string_lossy().to_string());
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let candidates = [
+                r"C:\Program Files\PHP\current\php-cgi.exe",
+                r"C:\Program Files (x86)\PHP\current\php-cgi.exe",
+                r"C:\php\php-cgi.exe",
+            ];
+            for c in &candidates {
+                if std::path::Path::new(c).exists() {
+                    return Some(c.to_string());
+                }
             }
-        }
-    }
-    None
+            if let Ok(path) = std::env::var("PATH") {
+                for dir in path.split(';') {
+                    let p = std::path::Path::new(dir).join("php-cgi.exe");
+                    if p.exists() {
+                        return Some(p.to_string_lossy().to_string());
+                    }
+                }
+            }
+            None
+        })
+        .clone()
 }
 
 /// Write php.ini overrides to a temp directory (for PHP_INI_SCAN_DIR).

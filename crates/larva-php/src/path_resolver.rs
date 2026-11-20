@@ -92,14 +92,23 @@ pub fn default_resolver() -> Box<dyn PathResolver> {
     }
 }
 
-/// Convenience: resolve a root path using the default OS resolver.
+/// Convenience: resolve a root path using the OS resolver (no allocation).
 pub fn resolve_root(root: &str) -> io::Result<PathBuf> {
-    default_resolver().resolve_root(root)
+    if cfg!(windows) {
+        WindowsPathResolver.resolve_root(root)
+    } else {
+        UnixPathResolver.resolve_root(root)
+    }
 }
 
 /// Convenience: make a path native (strip verbatim prefix on Windows).
+/// Uses the OS resolver directly so the hot path does no heap allocation.
 pub fn make_native(path: &Path) -> PathBuf {
-    default_resolver().make_native(path)
+    if cfg!(windows) {
+        WindowsPathResolver.make_native(path)
+    } else {
+        UnixPathResolver.make_native(path)
+    }
 }
 
 #[cfg(test)]
