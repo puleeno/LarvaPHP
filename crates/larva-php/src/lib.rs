@@ -38,6 +38,7 @@ pub mod metrics;
 pub mod options;
 pub mod path_resolver;
 pub mod phpinfo;
+pub mod runtime;
 pub mod scaling;
 pub mod server;
 pub mod thread;
