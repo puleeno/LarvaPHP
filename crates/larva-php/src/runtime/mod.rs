@@ -9,11 +9,13 @@
 pub mod executor;
 pub mod ipc;
 pub mod master;
+pub mod php_ini;
 pub mod worker;
 
-pub use executor::{default_executor, PhpExecutor, Request, Response, MockExecutor, FfiExecutor};
+pub use executor::{default_executor, PhpExecutor, Request, Response, MockExecutor, FfiExecutor, CgiExecutor};
 pub use ipc::{SharedMemory, WorkerShm};
 pub use master::WorkerPool;
+pub use php_ini::{PhpIniResolver, PhpIniConfig, ChainResolver, EnvResolver, PathResolver, IniEntriesResolver, resolve as resolve_php_ini};
 pub use worker::run_worker;
 
 use std::sync::OnceLock;

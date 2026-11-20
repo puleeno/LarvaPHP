@@ -75,11 +75,82 @@ impl PhpExecutor for MockExecutor {
     }
 }
 
+/// A CGI executor that spawns php-cgi.exe per request (reliable; loads php.ini).
+///
+/// This is the default: php-cgi reads the system php.ini, so extensions like
+/// mysqli/pdo_mysql load correctly. It's slower than FFI (~80ms spawn) but
+/// universally compatible.
+pub struct CgiExecutor;
+
+impl PhpExecutor for CgiExecutor {
+    fn name(&self) -> &str {
+        "cgi"
+    }
+
+    fn execute(&self, req: &Request) -> Result<Response, String> {
+        let php_exe = crate::server::find_php_cgi()
+            .ok_or_else(|| "php-cgi.exe not found".to_string())?;
+
+        let mut cmd = std::process::Command::new(php_exe);
+        cmd.env("REQUEST_METHOD", &req.method);
+        cmd.env("REQUEST_URI", &req.uri);
+        cmd.env("SCRIPT_FILENAME", &req.script_path);
+        cmd.env("SCRIPT_NAME", &req.uri);
+        cmd.env("REDIRECT_STATUS", "200");
+        cmd.env("GATEWAY_INTERFACE", "CGI/1.1");
+        for (k, v) in &req.headers {
+            cmd.env(k, v);
+        }
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| format!("spawn php-cgi: {}", e))?;
+        if !req.body.is_empty() {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(&req.body);
+            }
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("wait php-cgi: {}", e))?;
+
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
+        let (head, body) = if let Some(p) = text.find("\r\n\r\n") {
+            (&text[..p], &text[p + 4..])
+        } else if let Some(p) = text.find("\n\n") {
+            (&text[..p], &text[p + 2..])
+        } else {
+            ("", text.as_str())
+        };
+
+        let mut status = 200u16;
+        let mut headers = Vec::new();
+        for line in head.lines() {
+            if let Some((k, v)) = line.split_once(':') {
+                if k.eq_ignore_ascii_case("status") {
+                    status = v
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(200);
+                    continue;
+                }
+                headers.push((k.trim().to_string(), v.trim().to_string()));
+            }
+        }
+        Ok(Response {
+            status,
+            headers,
+            body: body.as_bytes().to_vec(),
+        })
+    }
+}
+
 /// An embedded PHP executor (requires the `embedded` feature + PHP headers).
 ///
-/// This is a stub: it wires to `crate::embed_php::execute_script`, which needs
-/// the exact PHP 8.x ABI (sapi_module_struct / zend_file_handle). See
-/// `embed_php.rs` for the ABI requirement.
+/// Fast (~8ms) but the embedded runtime must load extensions via php.ini.
 pub struct FfiExecutor;
 
 impl PhpExecutor for FfiExecutor {
@@ -122,14 +193,18 @@ impl PhpExecutor for FfiExecutor {
 }
 
 /// Construct the default executor for a worker.
+///
+/// Defaults to CGI (reliable, loads php.ini + extensions). Set the
+/// `LARVA_PHP_EXECUTOR=ffi` environment variable to use the embedded FFI
+/// executor (faster, but extensions must be loaded via php.ini).
 pub fn default_executor() -> Arc<dyn PhpExecutor> {
-    // Use FFI when the feature is compiled in and the runtime is available;
-    // otherwise fall back to the mock so the pipeline stays testable.
-    #[cfg(feature = "embedded")]
-    {
-        if crate::embed_php::is_available() {
-            return Arc::new(FfiExecutor);
+    if std::env::var("LARVA_PHP_EXECUTOR").as_deref() == Ok("ffi") {
+        #[cfg(feature = "embedded")]
+        {
+            if crate::embed_php::is_available() {
+                return Arc::new(FfiExecutor);
+            }
         }
     }
-    Arc::new(MockExecutor)
+    Arc::new(CgiExecutor)
 }

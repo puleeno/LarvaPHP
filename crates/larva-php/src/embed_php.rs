@@ -88,6 +88,13 @@ pub mod imp {
     type FnPhpRequestShutdown = unsafe extern "C" fn(*mut c_void);
     type FnPhpExecuteScript = unsafe extern "C" fn(*mut c_void);
     type FnZendStreamInitFilename = unsafe extern "C" fn(*mut c_void, *const c_char);
+    type FnZendParseIniString = unsafe extern "C" fn(
+        *const c_char,
+        bool,
+        c_int,
+        *mut c_void,
+        *mut c_void,
+    ) -> c_int;
 
     struct PhpApi {
         sapi_startup: FnSapiStartup,
@@ -96,6 +103,7 @@ pub mod imp {
         php_request_shutdown: FnPhpRequestShutdown,
         php_execute_script: FnPhpExecuteScript,
         zend_stream_init_filename: FnZendStreamInitFilename,
+        zend_parse_ini_string: Option<FnZendParseIniString>,
     }
 
     unsafe impl Send for PhpApi {}
@@ -120,7 +128,12 @@ pub mod imp {
         1 // SAPI_HEADER_SENT_SUCCESSFULLY
     }
     unsafe extern "C" fn send_header_noop(_: *mut c_void, _: *mut c_void) {}
-    unsafe extern "C" fn log_message_noop(_: *const c_char, _: c_int) {}
+    unsafe extern "C" fn log_message_noop(msg: *const c_char, _syslog_type_int: c_int) {
+        if !msg.is_null() {
+            let s = std::ffi::CStr::from_ptr(msg).to_string_lossy();
+            eprintln!("[php] {}", s);
+        }
+    }
     unsafe extern "C" fn read_post_zero(_: *mut c_char, _: usize) -> usize {
         0
     }
@@ -176,6 +189,9 @@ pub mod imp {
                 php_request_shutdown: sym!("php_request_shutdown", FnPhpRequestShutdown),
                 php_execute_script: sym!("php_execute_script", FnPhpExecuteScript),
                 zend_stream_init_filename: sym!("zend_stream_init_filename", FnZendStreamInitFilename),
+                // zend_parse_ini_string is optional; load if present.
+                zend_parse_ini_string: load_symbol(module, "zend_parse_ini_string")
+                    .map(|p| unsafe { std::mem::transmute::<*mut c_void, FnZendParseIniString>(p) }),
             };
 
             let mut sapi = Box::new(SapiModule::new());
@@ -189,10 +205,41 @@ pub mod imp {
             sapi.read_post = Some(read_post_zero);
             sapi.read_cookies = Some(read_cookies_null);
 
+            // Resolve PHP INI configuration (Strategy + Chain of Responsibility).
+            // The embedded runtime does NOT scan conf.d, so we set:
+            //   1. php_ini_path_override -> the php.ini file
+            //   2. PHPRC -> the php.ini directory (for extension_dir resolution)
+            //   3. ini_entries -> force-load extensions (mysqli, pdo_mysql, ...)
+            let ini_cfg = crate::runtime::php_ini::resolve();
+
+            if let Some(ref dir) = ini_cfg.dir {
+                std::env::set_var("PHPRC", dir);
+            }
+
+            if let Some(ref path) = ini_cfg.path {
+                if let Ok(cstr) = CString::new(path.to_string_lossy().to_string()) {
+                    // Leak the CString: PHP holds the pointer for the process lifetime.
+                    let ptr = Box::into_raw(Box::new(cstr)) as *const c_char;
+                    sapi.php_ini_path_override = ptr;
+                }
+                tracing::info!("embedded PHP using php.ini: {}", path.display());
+            }
+
+            if let Some(ref entries) = ini_cfg.entries {
+                if let Ok(cstr) = CString::new(entries.clone()) {
+                    // Leak: PHP holds the ini_entries pointer for the process lifetime.
+                    let ptr = Box::into_raw(Box::new(cstr)) as *const c_char;
+                    sapi.ini_entries = ptr;
+                    tracing::info!("embedded PHP ini_entries: {} bytes", entries.len());
+                }
+            }
+
             unsafe {
                 // sapi_startup copies the struct into the global sapi_module.
                 (api.sapi_startup)(&mut *sapi as *mut SapiModule as *mut c_void);
                 // php_module_startup initializes the Zend Engine + standard modules.
+                // php_init_config() (called inside) reads php_ini_path_override
+                // and ini_entries that we set above.
                 let rc = (api.php_module_startup)(
                     &mut *sapi as *mut SapiModule as *mut c_void,
                     std::ptr::null_mut(),
