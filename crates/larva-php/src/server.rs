@@ -129,8 +129,13 @@ impl RateLimiter {
 
 impl Server {
     /// Create a new server with the given root directory.
+    ///
+    /// The root path is made absolute and symlinks are resolved (like
+    /// FrankenPHP's `resolve_root_symlink`), so the document root is always a
+    /// canonical path. If the path does not exist yet, resolution falls back to
+    /// the absolute path without canonicalization.
     pub fn new(root: &str) -> Result<Self> {
-        let abs_root = fast_abs(root)
+        let abs_root = resolve_root_symlink(root)
             .map_err(|e| Error::Ffi(e.to_string()))?
             .to_string_lossy()
             .into_owned();
@@ -1111,6 +1116,19 @@ fn try_x_sendfile(
     Some(builder.body(Full::new(Bytes::from(content))).unwrap())
 }
 
+/// Resolve the document root to a canonical absolute path, following symlinks.
+///
+/// Mirrors FrankenPHP's `resolve_root_symlink`. Falls back to the plain
+/// absolute path (without canonicalization) when the path does not exist or
+/// cannot be resolved, so a not-yet-created root still works.
+pub fn resolve_root_symlink(root: &str) -> std::io::Result<PathBuf> {
+    let abs = fast_abs(root)?;
+    match std::fs::canonicalize(&abs) {
+        Ok(canonical) => Ok(canonical),
+        Err(_) => Ok(abs),
+    }
+}
+
 /// Resolve the PHP script path from the request URI (static helper).
 fn resolve_script_path_static(uri: &str, root: &str, split_path: &[String]) -> Option<String> {
     let path = uri.split('?').next().unwrap_or(uri);
@@ -1749,5 +1767,24 @@ mod tests {
             "C:/www/.env".to_string(),
         )];
         assert!(try_x_sendfile(&headers, StatusCode::OK).is_none());
+    }
+
+    // === resolve_root_symlink tests ===
+
+    #[test]
+    fn resolve_root_symlink_existing_dir() {
+        let dir = std::env::temp_dir();
+        let resolved = resolve_root_symlink(&dir.to_string_lossy()).unwrap();
+        // Canonicalized path should exist and be absolute.
+        assert!(resolved.is_absolute());
+        assert!(resolved.exists());
+    }
+
+    #[test]
+    fn resolve_root_symlink_nonexistent_falls_back() {
+        // A path that does not exist should fall back to the absolute path
+        // rather than erroring.
+        let resolved = resolve_root_symlink("C:\\definitely\\nonexistent\\path-xyz").unwrap();
+        assert!(resolved.to_string_lossy().to_string().contains("nonexistent"));
     }
 }
