@@ -19,6 +19,10 @@ struct Args {
     #[arg(short = 'a', long = "addr", default_value = "127.0.0.1:8000")]
     addr: String,
 
+    /// Set a php.ini directive (repeatable), e.g. --php-ini precision=14
+    #[arg(long = "php-ini", value_name = "KEY=VALUE")]
+    php_ini: Vec<String>,
+
     /// Show version information
     #[arg(short = 'v', long = "version")]
     version: bool,
@@ -37,6 +41,7 @@ fn main() -> ExitCode {
         println!("Usage:");
         println!("  larva-php <script.php> [args...]    Run a PHP script");
         println!("  larva-php -root <dir>               Serve PHP application from directory");
+        println!("  larva-php --php-ini key=value       Set a php.ini directive (repeatable)");
         println!("  larva-php --version                 Show version");
         println!("  larva-php --help                    Show this help");
         return ExitCode::SUCCESS;
@@ -67,7 +72,25 @@ fn main() -> ExitCode {
         };
 
         // Initialize PHP runtime
-        let server = larva_php::server::Server::new(&root).unwrap();
+        let mut server = larva_php::server::Server::new(&root).unwrap();
+
+        // Apply php.ini overrides from --php-ini KEY=VALUE flags.
+        if !args.php_ini.is_empty() {
+            let mut ini = std::collections::HashMap::new();
+            for kv in &args.php_ini {
+                match kv.split_once('=') {
+                    Some((k, v)) => {
+                        ini.insert(k.trim().to_string(), v.trim().to_string());
+                    }
+                    None => {
+                        eprintln!("Invalid --php-ini value '{}' (expected KEY=VALUE)", kv);
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            server.set_php_ini(ini);
+        }
+
         server.activate();
 
         // Start PHP main thread

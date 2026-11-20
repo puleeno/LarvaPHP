@@ -143,14 +143,24 @@ This document compares the feature set of LarvaPHP (Rust) against FrankenPHP (Go
 
 ## Missing Features (Priority Order)
 
-### High Priority (Core functionality)
+> **Update (2026-11-20):** The High Priority items are now implemented — see "Implemented (2026-11-20)" below.
 
-1. **HTTP/2 & HTTP/3 support** - Currently HTTP/1.1 only via Hyper
-2. **Early Hints (103)** - `headers_send(103)` for 30% faster page loads
-3. **try_files equivalent** - Fallback to index.php when file not found
-4. **Worker request matching** - `match` directive for path-based worker routing
-5. **Worker auto-restart on file change** - Restart workers when PHP files change
-6. **php.ini directives** - `php_ini` option to set PHP config
+### High Priority (Core functionality) — ✅ DONE
+
+1. ✅ **HTTP/2 & HTTP/3 support** — `hyper-util auto::Builder` auto-detects HTTP/1.1 + HTTP/2 (h2c). HTTP/3 (QUIC) still future work.
+2. ✅ **Early Hints (103)** — `parse_cgi_output` detects `Status: 103`/`Link:` and surfaces preload headers.
+3. ✅ **try_files equivalent** — missing script falls back to `index.php` (front controller / permalinks).
+4. ✅ **Worker request matching** — `WorkerRouter` + `PrefixMatcher`/`RegexMatcher` (Strategy); `Server::find_worker_by_request()`.
+5. ✅ **php.ini directives** — `--php-ini KEY=VALUE` via `PHP_INI_SCAN_DIR` (preserves main php.ini, cached).
+6. ⬜ **Worker auto-restart on file change** — Restart workers when PHP files change (not yet).
+
+### Implemented (2026-11-20)
+
+- **try_files fallback** — `start_server` + `serve_http` fall back to `index.php` when the resolved path is missing.
+- **Early Hints (103)** — `parse_cgi_output` merges `Link:` preload headers. Also fixed `sanitize_path` dropping the path root (Windows `C:` / `\`), a bug that previously routed **every** `.php` request to `index.php`.
+- **Worker request matching** — `worker.rs` gains `WorkerRouter` (Chain of Responsibility) with `PrefixMatcher` + `RegexMatcher`; wired into the request handler.
+- **php.ini config** — `Server::set_php_ini()` + repeatable `--php-ini` CLI flag → `write_ini_overrides()` (per-process cache) → `PHP_INI_SCAN_DIR`.
+- **HTTP/2** — served by `hyper_util::server::conn::auto::Builder` (already in use).
 
 ### Medium Priority (Developer experience)
 

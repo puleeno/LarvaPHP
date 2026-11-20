@@ -46,6 +46,8 @@ pub struct Server {
     pub rate_limiter: RateLimiter,
     /// Max request body size in bytes (default: 10 MB)
     pub max_body_size: u64,
+    /// PHP configuration overrides (`php_ini` / `-d` directives).
+    pub php_ini: HashMap<String, String>,
 }
 
 /// Cached file metadata (nginx open_file_cache equivalent).
@@ -148,6 +150,7 @@ impl Server {
             file_cache: DashMap::new(),
             rate_limiter: RateLimiter::new(RateLimitConfig::default()),
             max_body_size: 10 * 1024 * 1024, // 10 MB
+            php_ini: HashMap::new(),
         })
     }
 
@@ -168,7 +171,29 @@ impl Server {
             file_cache: DashMap::new(),
             rate_limiter: RateLimiter::new(RateLimitConfig::default()),
             max_body_size: 10 * 1024 * 1024, // 10 MB
+            php_ini: HashMap::new(),
         }
+    }
+
+    /// Set PHP configuration overrides (applied as `-d key=value` to php-cgi).
+    pub fn set_php_ini(&mut self, ini: HashMap<String, String>) {
+        self.php_ini = ini;
+    }
+
+    /// Find a worker whose request matcher matches the given request.
+    ///
+    /// Strategy pattern: iterates registered matchers, first match wins.
+    /// O(n) where n = number of matcher workers (typically small).
+    pub fn find_worker_by_request(&self, req: &Request<IncomingBody>) -> Option<Arc<Worker>> {
+        let matchers = self.workers_with_request_matcher.read().unwrap();
+        for worker in matchers.iter() {
+            if let Some(matcher) = worker.match_request() {
+                if matcher(req) {
+                    return Some(worker.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Get the server name.
@@ -273,8 +298,18 @@ impl Server {
         let ctx = PhpContext::from_request(&req, Arc::new(Server::fallback()), opts)?;
         ctx.validate()?;
 
+        // Worker request matching (Strategy: first matcher wins).
+        // If a worker matches, route to its script (front controller).
+        let worker_script = self
+            .find_worker_by_request(&req)
+            .map(|w| w.file_name().to_string());
+
         // Determine the script filename
-        let script_path = self.resolve_script_path(ctx.request_uri.as_str())?;
+        let script_path = if let Some(ws) = worker_script {
+            ws
+        } else {
+            self.resolve_script_path(ctx.request_uri.as_str())?
+        };
 
         // If the resolved path doesn't exist, try index.php (WordPress permalinks)
         let script_path = if !std::path::Path::new(&script_path).exists() {
@@ -315,7 +350,7 @@ impl Server {
         let body = Bytes::from(body_bytes);
 
         // Execute the PHP script via CGI and capture output
-        let output = execute_php_cgi(&script_path, &ctx, &body)?;
+        let output = execute_php_cgi(&script_path, &ctx, &body, &self.php_ini)?;
 
         // Parse CGI output: headers + optional blank line + body
         let (status_code, headers, body_bytes) = parse_cgi_output(&output);
@@ -383,7 +418,7 @@ impl Server {
 
     /// Try resolving index.php for the given URI (WordPress permalink fallback).
     fn resolve_index_php(&self, uri: &str) -> Option<String> {
-        let path = uri.split('?').next().unwrap_or(uri);
+        let _path = uri.split('?').next().unwrap_or(uri);
 
         // Try root index.php first (WordPress front controller)
         let mut index_path = PathBuf::from(&self.root);
@@ -483,6 +518,10 @@ impl Server {
             .map_err(|e| Error::Io(e))?;
         let server_root = self.root.clone();
         let server_split_path = self.split_path.clone();
+        // Snapshot worker matchers and php.ini once (Flyweight: shared via Arc).
+        let server_workers: Arc<Vec<Arc<Worker>>> =
+            Arc::new(self.workers_with_request_matcher.read().unwrap().clone());
+        let server_php_ini: Arc<HashMap<String, String>> = Arc::new(self.php_ini.clone());
 
         loop {
             let (stream, _) = listener.accept().await.map_err(|e| Error::Io(e))?;
@@ -493,6 +532,8 @@ impl Server {
             let registered = self.is_registered.load(Ordering::Acquire);
             let rate_limiter = self.rate_limiter.clone();
             let max_body_size = self.max_body_size;
+            let workers = server_workers.clone();
+            let php_ini = server_php_ini.clone();
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
@@ -505,6 +546,8 @@ impl Server {
                             let registered = registered.clone();
                             let rate_limiter = rate_limiter.clone();
                             let max_body_size = max_body_size;
+                            let workers = workers.clone();
+                            let php_ini = php_ini.clone();
                             let client_ip = peer_addr.ip().to_string();
                             async move {
                                 if !registered {
@@ -534,20 +577,39 @@ impl Server {
                                 }
 
                                 let uri = req.uri().to_string();
-                                let script_path =
-                                    resolve_script_path_static(&uri, &root, &split_path);
 
-                                // If the resolved path doesn't exist, try index.php
-                                let script_path =
-                                    if let Some(ref p) = script_path {
+                                // Worker request matching (Strategy: first matcher wins).
+                                // If a worker matches, route to its script (front controller).
+                                let mut worker_script: Option<String> = None;
+                                for worker in workers.iter() {
+                                    if let Some(matcher) = worker.match_request() {
+                                        if matcher(&req) {
+                                            worker_script =
+                                                Some(worker.file_name().to_string());
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                let script_path = if let Some(ws) = worker_script {
+                                    Some(ws)
+                                } else {
+                                    let resolved =
+                                        resolve_script_path_static(&uri, &root, &split_path);
+
+                                    // try_files fallback: if the resolved path doesn't
+                                    // exist (or is a directory without index), fall back
+                                    // to index.php (front controller / permalink support).
+                                    if let Some(ref p) = resolved {
                                         if std::path::Path::new(p).exists() {
-                                            script_path
+                                            resolved
                                         } else {
                                             resolve_index_php_static(&uri, &root)
                                         }
                                     } else {
                                         resolve_index_php_static(&uri, &root)
-                                    };
+                                    }
+                                };
 
                                 let Some(path) = script_path else {
                                     return Ok::<Response<Full<Bytes>>, hyper::Error>(
@@ -698,7 +760,7 @@ impl Server {
                                 }
                                 let body = Bytes::from(body_bytes);
 
-                                match execute_php_cgi(&path, &ctx, &body) {
+                                match execute_php_cgi(&path, &ctx, &body, &php_ini) {
                                     Ok(output) => {
                                         let (status_code, headers, body_bytes) =
                                             parse_cgi_output(&output);
@@ -766,8 +828,62 @@ fn find_php_cgi() -> Option<String> {
     None
 }
 
+/// Write php.ini overrides to a temp directory (for PHP_INI_SCAN_DIR).
+/// The directory is created once per unique override set and cached, so
+/// per-request cost is a hash lookup + mutex (no disk I/O after first write).
+fn write_ini_overrides(php_ini: &HashMap<String, String>) -> Option<std::path::PathBuf> {
+    if php_ini.is_empty() {
+        return None;
+    }
+
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Deterministic content + cache key.
+    let mut keys: Vec<&String> = php_ini.keys().collect();
+    keys.sort_unstable();
+    let overrides: String = keys
+        .iter()
+        .filter_map(|k| php_ini.get(*k).map(|v| format!("{}={}", k, v)))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut hasher = DefaultHasher::new();
+    overrides.hash(&mut hasher);
+    let key = hasher.finish();
+
+    static CACHE: once_cell::sync::Lazy<
+        std::sync::Mutex<HashMap<u64, std::path::PathBuf>>,
+    > = once_cell::sync::Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+    let mut cache = CACHE.lock().unwrap();
+    if let Some(dir) = cache.get(&key) {
+        if dir.exists() {
+            return Some(dir.clone());
+        }
+    }
+
+    // Create a unique temp directory for this override set.
+    let dir = std::env::temp_dir().join(format!("larva-php-ini-{:x}", key));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let ini_file = dir.join("00-overrides.ini");
+    if std::fs::write(&ini_file, &overrides).is_err() {
+        return None;
+    }
+
+    cache.insert(key, dir.clone());
+    Some(dir)
+}
+
 /// Execute a PHP script via php-cgi.exe CGI subprocess and capture output.
-fn execute_php_cgi(script_path: &str, ctx: &PhpContext, body: &[u8]) -> Result<String> {
+fn execute_php_cgi(
+    script_path: &str,
+    ctx: &PhpContext,
+    body: &[u8],
+    php_ini: &HashMap<String, String>,
+) -> Result<String> {
     let php_exe = find_php_cgi()
         .ok_or_else(|| Error::Ffi("php-cgi.exe not found".to_string()))?;
 
@@ -777,6 +893,16 @@ fn execute_php_cgi(script_path: &str, ctx: &PhpContext, body: &[u8]) -> Result<S
             .parent()
             .unwrap_or(std::path::Path::new(".")),
     );
+
+    // Apply php.ini overrides via PHP_INI_SCAN_DIR (env-based). This preserves
+    // the main php.ini and loads our overrides afterwards. The directory is
+    // written once per unique override set and cached.
+    match write_ini_overrides(php_ini) {
+        Some(dir) => {
+            cmd.env("PHP_INI_SCAN_DIR", &dir);
+        }
+        None => {}
+    }
 
     // Set CGI environment variables
     cmd.env("REQUEST_METHOD", &ctx.request_method);
@@ -817,20 +943,30 @@ fn execute_php_cgi(script_path: &str, ctx: &PhpContext, body: &[u8]) -> Result<S
         .wait_with_output()
         .map_err(|e| Error::Ffi(format!("Failed to wait for php-cgi: {}", e)))?;
 
+    if !output.stderr.is_empty() {
+        tracing::debug!(
+            "php-cgi stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Parse CGI output: split headers from body at the first blank line.
+/// Also detects Early Hints (103) responses and extracts Link headers.
 fn parse_cgi_output(output: &str) -> (StatusCode, Vec<(String, String)>, Vec<u8>) {
     let mut headers = Vec::new();
     let mut body_start = 0;
     let mut status_code = StatusCode::OK;
+    let mut early_hints: Vec<(String, String)> = Vec::new();
 
     // Find the blank line separating headers from body
     if let Some(pos) = output.find("\r\n\r\n") {
         let header_section = &output[..pos];
         body_start = pos + 4;
 
+        let mut is_early_hints = false;
         for line in header_section.split("\r\n") {
             if let Some((name, value)) = line.split_once(':') {
                 let name = name.trim();
@@ -839,18 +975,32 @@ fn parse_cgi_output(output: &str) -> (StatusCode, Vec<(String, String)>, Vec<u8>
                     // Parse CGI Status header: "302 Found" or just "302"
                     if let Some(code_str) = value.split_whitespace().next() {
                         if let Ok(code) = code_str.parse::<u16>() {
-                            status_code = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+                            if code == 103 {
+                                // Early Hints response
+                                is_early_hints = true;
+                            } else if is_early_hints && code >= 200 {
+                                // Main response starts after Early Hints
+                                is_early_hints = false;
+                                status_code = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+                            } else {
+                                status_code = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+                            }
                         }
                     }
                     continue; // Don't add Status: to response headers
                 }
-                headers.push((name.to_string(), value.to_string()));
+                if is_early_hints {
+                    early_hints.push((name.to_string(), value.to_string()));
+                } else {
+                    headers.push((name.to_string(), value.to_string()));
+                }
             }
         }
     } else if let Some(pos) = output.find("\n\n") {
         let header_section = &output[..pos];
         body_start = pos + 2;
 
+        let mut is_early_hints = false;
         for line in header_section.split('\n') {
             if let Some((name, value)) = line.split_once(':') {
                 let name = name.trim();
@@ -858,13 +1008,32 @@ fn parse_cgi_output(output: &str) -> (StatusCode, Vec<(String, String)>, Vec<u8>
                 if name.eq_ignore_ascii_case("status") {
                     if let Some(code_str) = value.split_whitespace().next() {
                         if let Ok(code) = code_str.parse::<u16>() {
-                            status_code = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+                            if code == 103 {
+                                is_early_hints = true;
+                            } else if is_early_hints && code >= 200 {
+                                is_early_hints = false;
+                                status_code = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+                            } else {
+                                status_code = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+                            }
                         }
                     }
                     continue;
                 }
-                headers.push((name.to_string(), value.to_string()));
+                if is_early_hints {
+                    early_hints.push((name.to_string(), value.to_string()));
+                } else {
+                    headers.push((name.to_string(), value.to_string()));
+                }
             }
+        }
+    }
+
+    // Merge Early Hints Link headers into main headers (for browser preloading)
+    for (name, value) in &early_hints {
+        if name.eq_ignore_ascii_case("link") {
+            // Add as a Link header to the main response for preload hints
+            headers.push((name.clone(), value.clone()));
         }
     }
 
@@ -1092,7 +1261,9 @@ fn sanitize_path(path: &PathBuf) -> Result<PathBuf> {
             }
             std::path::Component::CurDir => {}
             std::path::Component::Normal(c) => components.push(c),
-            std::path::Component::RootDir => {}
+            // Preserve the root (e.g. "\" on Windows or "/" on Unix) and drive
+            // prefix (e.g. "C:") so the sanitized path keeps its absolute form.
+            std::path::Component::RootDir => components.push(component.as_os_str()),
             std::path::Component::Prefix(_) => components.push(component.as_os_str()),
         }
     }
@@ -1329,6 +1500,27 @@ mod tests {
         let path = PathBuf::from("");
         let result = sanitize_path(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn sanitize_path_preserves_root() {
+        // Regression: the root ("/" or "\") must be preserved so that
+        // sanitized paths stay rooted and starts_with(root) succeeds.
+        let path = PathBuf::from("/var/www/index.php");
+        let result = sanitize_path(&path).unwrap();
+        assert!(result.has_root(), "sanitized path must keep its root: {:?}", result);
+        assert!(result.starts_with("/var/www"));
+    }
+
+    #[test]
+    fn sanitize_path_windows_drive_preserved() {
+        let path = PathBuf::from("C:/www/index.php");
+        let result = sanitize_path(&path).unwrap();
+        let s = result.to_string_lossy().to_string();
+        // Drive prefix and root separator must both survive.
+        assert!(s.starts_with("C:") || s.starts_with("c:"));
+        assert!(s.contains("www"));
+        assert!(s.contains("index.php"));
     }
 
     // === parse_cgi_output tests ===

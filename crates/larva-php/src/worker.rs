@@ -149,6 +149,83 @@ impl Default for WorkerRegistry {
 pub static WORKER_REGISTRY: once_cell::sync::Lazy<RwLock<WorkerRegistry>> =
     once_cell::sync::Lazy::new(|| RwLock::new(WorkerRegistry::new()));
 
+// ============================================================================
+// Worker Router (Strategy pattern for request matching)
+// ============================================================================
+
+/// Strategy trait for matching requests to workers.
+pub trait WorkerMatcher: Send + Sync {
+    fn matches(&self, uri: &str) -> bool;
+}
+
+/// Prefix matcher - matches URIs starting with a prefix.
+pub struct PrefixMatcher {
+    prefix: String,
+}
+
+impl PrefixMatcher {
+    pub fn new(prefix: impl Into<String>) -> Self {
+        Self { prefix: prefix.into() }
+    }
+}
+
+impl WorkerMatcher for PrefixMatcher {
+    fn matches(&self, uri: &str) -> bool {
+        uri.starts_with(&self.prefix)
+    }
+}
+
+/// Regex matcher - matches URIs against a regex pattern.
+pub struct RegexMatcher {
+    re: regex::Regex,
+}
+
+impl RegexMatcher {
+    pub fn new(pattern: &str) -> Option<Self> {
+        regex::Regex::new(pattern).ok().map(|re| Self { re })
+    }
+}
+
+impl WorkerMatcher for RegexMatcher {
+    fn matches(&self, uri: &str) -> bool {
+        self.re.is_match(uri)
+    }
+}
+
+/// Router that dispatches requests to workers based on matchers.
+/// Uses a sorted list of (matcher, worker) pairs for O(n) lookup.
+pub struct WorkerRouter {
+    routes: Vec<(Box<dyn WorkerMatcher>, Arc<Worker>)>,
+}
+
+impl WorkerRouter {
+    pub fn new() -> Self {
+        Self { routes: Vec::new() }
+    }
+
+    /// Add a route with a matcher.
+    pub fn add_route(&mut self, matcher: Box<dyn WorkerMatcher>, worker: Arc<Worker>) {
+        self.routes.push((matcher, worker));
+    }
+
+    /// Find the first worker whose matcher matches the URI.
+    /// O(n) where n = number of routes (typically small).
+    pub fn find_worker(&self, uri: &str) -> Option<&Arc<Worker>> {
+        for (matcher, worker) in &self.routes {
+            if matcher.matches(uri) {
+                return Some(worker);
+            }
+        }
+        None
+    }
+}
+
+impl Default for WorkerRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Resolve a worker file path to an absolute path.
 pub fn resolve_worker_file(file_name: &str) -> Result<(String, String)> {
     let declared = crate::cgi::fastabs::fast_abs(file_name)
@@ -193,4 +270,75 @@ pub fn check_worker_declaration(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_matcher_matches() {
+        let m = PrefixMatcher::new("/api");
+        assert!(m.matches("/api/users"));
+        assert!(m.matches("/api"));
+        assert!(!m.matches("/blog/api"));
+    }
+
+    #[test]
+    fn regex_matcher_matches() {
+        let m = RegexMatcher::new(r"^/api/v\d+").unwrap();
+        assert!(m.matches("/api/v1/users"));
+        assert!(!m.matches("/api/vX/users"));
+    }
+
+    #[test]
+    fn regex_matcher_invalid_pattern() {
+        assert!(RegexMatcher::new("[invalid").is_none());
+    }
+
+    #[test]
+    fn worker_router_first_match_wins() {
+        let w1 = Arc::new(Worker::new(
+            "w1".to_string(),
+            "/app/api.php".to_string(),
+            "/app/api.php".to_string(),
+            1,
+            0,
+            6,
+            None,
+        ));
+        let w2 = Arc::new(Worker::new(
+            "w2".to_string(),
+            "/app/index.php".to_string(),
+            "/app/index.php".to_string(),
+            1,
+            0,
+            6,
+            None,
+        ));
+
+        let mut router = WorkerRouter::new();
+        router.add_route(Box::new(PrefixMatcher::new("/api")), w1.clone());
+        router.add_route(Box::new(PrefixMatcher::new("/")), w2.clone());
+
+        // First matching route wins.
+        assert!(Arc::ptr_eq(router.find_worker("/api/users").unwrap(), &w1));
+        assert!(Arc::ptr_eq(router.find_worker("/blog").unwrap(), &w2));
+    }
+
+    #[test]
+    fn worker_router_no_match() {
+        let w1 = Arc::new(Worker::new(
+            "w1".to_string(),
+            "/app/api.php".to_string(),
+            "/app/api.php".to_string(),
+            1,
+            0,
+            6,
+            None,
+        ));
+        let mut router = WorkerRouter::new();
+        router.add_route(Box::new(PrefixMatcher::new("/api")), w1);
+        assert!(router.find_worker("/blog").is_none());
+    }
 }
