@@ -1,0 +1,24 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Docs
+docs/
+*.md
+
+# Local test artifacts
+*.log
+larva_stderr.log
+
+# OS
+.DS_Store
+Thumbs.db
