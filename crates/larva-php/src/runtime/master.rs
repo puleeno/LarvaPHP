@@ -53,6 +53,8 @@ impl WorkerPool {
                 .spawn()
                 .map_err(|e| format!("spawn worker {}: {}", i, e))?;
 
+            tracing::info!("worker {} spawned: pid={} shm={}", i, child.id(), shm_path.display());
+
             workers.push(WorkerHandle {
                 id: i,
                 shm: Mutex::new(shm),
