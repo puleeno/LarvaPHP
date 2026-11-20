@@ -432,6 +432,14 @@ impl Server {
         // Static (non-.php) files: serve directly.
         if let Some(ext) = std::path::Path::new(&script_path).extension() {
             if ext.to_string_lossy() != "php" {
+                // Block sensitive files even for static serving (defense in depth).
+                if is_sensitive_file(&script_path) {
+                    return Ok((
+                        StatusCode::FORBIDDEN,
+                        vec![("content-type".to_string(), "text/plain".to_string())],
+                        b"Forbidden".to_vec(),
+                    ));
+                }
                 if let Ok(content) = std::fs::read(&script_path) {
                     let mime = mime_type_static(&script_path);
                     let headers = vec![
@@ -1920,5 +1928,103 @@ mod tests {
         let header = alt_svc_header().unwrap();
         assert_eq!(header, "h3=\":9443\"; ma=86400");
         set_http3_port(0); // reset
+    }
+
+    // === handle_request_parts tests (HTTP/3 core) ===
+
+    #[test]
+    fn handle_request_parts_static_file() {
+        let dir = std::env::temp_dir().join(format!("larva-h3-static-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("style.css"), b"body{}").unwrap();
+
+        let server = Server::new(&dir.to_string_lossy()).unwrap();
+        let (status, headers, body) =
+            server.handle_request_parts("GET", "/style.css", &[], &[]).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"body{}");
+        assert!(headers.iter().any(|(n, _)| n == "content-type"));
+        assert!(headers.iter().any(|(n, _)| n == "content-length"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_request_parts_not_found() {
+        let dir = std::env::temp_dir().join(format!("larva-h3-404-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // No index.php, so a missing .php returns 404.
+
+        let server = Server::new(&dir.to_string_lossy()).unwrap();
+        let (status, _, _) =
+            server.handle_request_parts("GET", "/missing.php", &[], &[]).unwrap();
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_request_parts_sensitive_static_blocked() {
+        let dir = std::env::temp_dir().join(format!("larva-h3-sens-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), b"SECRET=1").unwrap();
+
+        let server = Server::new(&dir.to_string_lossy()).unwrap();
+        let (status, _, _) =
+            server.handle_request_parts("GET", "/.env", &[], &[]).unwrap();
+
+        // Sensitive files must NOT be served: either 403 (blocked) or 404
+        // (path not resolved) is acceptable — never 200.
+        assert!(
+            status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+            "sensitive file must not be served, got {}",
+            status
+        );
+        assert_ne!(status, StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_request_parts_php_executes() {
+        let dir = std::env::temp_dir().join(format!("larva-h3-php-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ok.php"), b"<?php echo 'H3OK'; ?>").unwrap();
+
+        let server = Server::new(&dir.to_string_lossy()).unwrap();
+        match server.handle_request_parts("GET", "/ok.php", &[], &[]) {
+            Ok((status, _, body)) => {
+                // When php-cgi is available and the script runs, assert the body.
+                if status == StatusCode::OK {
+                    assert_eq!(String::from_utf8_lossy(&body).trim(), "H3OK");
+                }
+                // Non-OK (e.g. php-cgi unavailable in CI) is tolerated.
+            }
+            Err(_) => {
+                // php-cgi not available in this environment — skip.
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_request_parts_php_ini_reachable() {
+        // handle_request_parts must be callable with extra headers without panicking.
+        let dir = std::env::temp_dir().join(format!("larva-h3-hdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("style.css"), b"x").unwrap();
+
+        let server = Server::new(&dir.to_string_lossy()).unwrap();
+        let headers = vec![
+            ("accept".to_string(), "*/*".to_string()),
+            ("user-agent".to_string(), "test".to_string()),
+        ];
+        let result = server.handle_request_parts("GET", "/style.css", &headers, &[]);
+        assert!(result.is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

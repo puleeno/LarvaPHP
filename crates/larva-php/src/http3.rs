@@ -432,3 +432,74 @@ pub mod imp {
 
 #[cfg(not(feature = "http3"))]
 pub use imp::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::server::Server;
+
+    fn test_server() -> Arc<Server> {
+        Arc::new(Server::new(".").unwrap())
+    }
+
+    #[cfg(not(feature = "http3"))]
+    #[test]
+    fn stub_new_does_not_panic() {
+        let h3 = Http3Server::new("127.0.0.1:0", "cert.pem", "key.pem", test_server());
+        // Constructing the stub is safe.
+        let _ = h3;
+    }
+
+    #[cfg(not(feature = "http3"))]
+    #[test]
+    fn stub_run_returns_error() {
+        let h3 = Http3Server::new("127.0.0.1:0", "cert.pem", "key.pem", test_server());
+        let err = h3.run().unwrap_err();
+        assert!(err.to_string().contains("not enabled"));
+    }
+
+    #[cfg(not(feature = "http3"))]
+    #[test]
+    fn stub_ensure_cert_passthrough() {
+        let (c, k) = ensure_cert("/tmp/c.pem", "/tmp/k.pem").unwrap();
+        assert_eq!(c, "/tmp/c.pem");
+        assert_eq!(k, "/tmp/k.pem");
+    }
+
+    #[cfg(feature = "http3")]
+    #[test]
+    fn ensure_cert_generates_files() {
+        let dir = std::env::temp_dir().join(format!("larva-cert-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("c.pem").to_string_lossy().to_string();
+        let key = dir.join("k.pem").to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&cert);
+        let _ = std::fs::remove_file(&key);
+
+        let (c, k) = ensure_cert(&cert, &key).unwrap();
+        assert!(std::path::Path::new(&c).exists(), "cert file should exist");
+        assert!(std::path::Path::new(&k).exists(), "key file should exist");
+        assert!(std::fs::metadata(&c).unwrap().len() > 0, "cert non-empty");
+        assert!(std::fs::metadata(&k).unwrap().len() > 0, "key non-empty");
+
+        // Idempotent: second call reuses existing files.
+        let (c2, _) = ensure_cert(&cert, &key).unwrap();
+        assert_eq!(c, c2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "http3")]
+    #[test]
+    fn run_with_missing_cert_errors() {
+        // run() must return Err (not panic) when the cert/key files are absent.
+        let h3 = Http3Server::new(
+            "127.0.0.1:0",
+            "nonexistent-cert.pem",
+            "nonexistent-key.pem",
+            test_server(),
+        );
+        assert!(h3.run().is_err());
+    }
+}
