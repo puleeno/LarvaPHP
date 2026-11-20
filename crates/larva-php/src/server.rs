@@ -982,24 +982,57 @@ pub fn find_php_cgi() -> Option<String> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let candidates = [
-                r"C:\Program Files\PHP\current\php-cgi.exe",
-                r"C:\Program Files (x86)\PHP\current\php-cgi.exe",
-                r"C:\php\php-cgi.exe",
-            ];
-            for c in &candidates {
-                if std::path::Path::new(c).exists() {
-                    return Some(c.to_string());
+            // 1. Highest priority: LARVA_PHP_CGI env var (explicit override).
+            if let Ok(exe) = std::env::var("LARVA_PHP_CGI") {
+                let p = std::path::Path::new(&exe);
+                if p.exists() {
+                    return Some(exe);
                 }
             }
-            if let Ok(path) = std::env::var("PATH") {
-                for dir in path.split(';') {
-                    let p = std::path::Path::new(dir).join("php-cgi.exe");
-                    if p.exists() {
-                        return Some(p.to_string_lossy().to_string());
+
+            // 2. Unix/Linux: use `which php-cgi` (or php if php-cgi not found).
+            #[cfg(not(windows))]
+            {
+                for cmd_name in &["php-cgi", "php"] {
+                    if let Ok(output) = std::process::Command::new("which")
+                        .arg(cmd_name)
+                        .output()
+                    {
+                        if output.status.success() {
+                            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                            if !path.is_empty() && std::path::Path::new(&path).exists() {
+                                return Some(path);
+                            }
+                        }
                     }
                 }
             }
+
+            // 3. Windows: search PATH for php-cgi.exe, then php.exe.
+            #[cfg(windows)]
+            {
+                if let Ok(path) = std::env::var("PATH") {
+                    for exe_name in &["php-cgi.exe", "php.exe"] {
+                        for dir in path.split(';') {
+                            let p = std::path::Path::new(dir).join(exe_name);
+                            if p.exists() {
+                                return Some(p.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
+
+                // Check PHPRC (Windows PHP install dir).
+                if let Ok(php_dir) = std::env::var("PHPRC") {
+                    for exe_name in &["php-cgi.exe", "php.exe"] {
+                        let p = std::path::Path::new(&php_dir).join(exe_name);
+                        if p.exists() {
+                            return Some(p.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+
             None
         })
         .clone()
