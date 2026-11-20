@@ -529,3 +529,141 @@ pub fn get_worker_by_name(name: &str) -> Option<Arc<crate::worker::Worker>> {
     let workers = worker_reg.workers_by_name.read().unwrap();
     workers.get(name).cloned()
 }
+
+// ============================================================================
+// Thread inspection API
+// ============================================================================
+
+/// A point-in-time snapshot of a PHP worker thread's state.
+#[derive(Debug, Clone)]
+pub struct ThreadInfo {
+    /// Thread slot index.
+    pub index: usize,
+    /// Current state.
+    pub state: ThreadState,
+    /// Human-readable state name.
+    pub state_name: &'static str,
+    /// Whether the thread is in a stable (idle/ready) state.
+    pub is_stable: bool,
+    /// Number of requests handled by this thread.
+    pub request_count: i64,
+    /// Milliseconds spent in the current wait (0 if not waiting).
+    pub wait_time_ms: i64,
+}
+
+/// Overall PHP runtime status (for monitoring / health checks).
+#[derive(Debug, Clone)]
+pub struct ThreadStatus {
+    pub is_running: bool,
+    pub main_state: Option<ThreadState>,
+    pub num_threads: usize,
+    pub ready_threads: usize,
+    pub busy_threads: usize,
+}
+
+/// Snapshot all registered PHP worker threads.
+///
+/// Returns an empty vector when the runtime is not running. O(n) over the
+/// thread table; intended for monitoring endpoints, not the hot path.
+pub fn threads() -> Vec<ThreadInfo> {
+    let reg = REGISTRY.read().unwrap();
+    if !reg.is_running.load(Ordering::Acquire) {
+        return Vec::new();
+    }
+    let threads = reg.threads.read().unwrap();
+    threads
+        .iter()
+        .enumerate()
+        .filter_map(|(i, slot)| {
+            slot.as_ref().map(|t| {
+                let state = t.state.get();
+                ThreadInfo {
+                    index: i,
+                    state,
+                    state_name: state.name(),
+                    is_stable: state.is_stable(),
+                    request_count: t.request_count.load(Ordering::Relaxed),
+                    wait_time_ms: t.state.wait_time(),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Get the main PHP thread's current state, if the runtime is running.
+pub fn main_thread_state() -> Option<ThreadState> {
+    let reg = REGISTRY.read().unwrap();
+    if !reg.is_running.load(Ordering::Acquire) {
+        return None;
+    }
+    let mt = reg.main_thread.read().unwrap();
+    mt.as_ref().map(|m| m.state.get())
+}
+
+/// Check whether the PHP runtime is currently running.
+pub fn is_running() -> bool {
+    REGISTRY.read().unwrap().is_running.load(Ordering::Acquire)
+}
+
+/// Aggregate runtime status: running flag, main state, and thread counts.
+pub fn status() -> ThreadStatus {
+    let reg = REGISTRY.read().unwrap();
+    let running = reg.is_running.load(Ordering::Acquire);
+    let main_state = if running {
+        reg.main_thread.read().unwrap().as_ref().map(|mt| mt.state.get())
+    } else {
+        None
+    };
+    let (num_threads, ready_threads, busy_threads) = if running {
+        let threads = reg.threads.read().unwrap();
+        let total = threads.len();
+        let mut ready = 0usize;
+        for slot in threads.iter().flatten() {
+            if slot.state.is(ThreadState::Ready) {
+                ready += 1;
+            }
+        }
+        (total, ready, total.saturating_sub(ready))
+    } else {
+        (0, 0, 0)
+    };
+    ThreadStatus {
+        is_running: running,
+        main_state,
+        num_threads,
+        ready_threads,
+        busy_threads,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_state_names() {
+        assert_eq!(ThreadState::Reserved.name(), "reserved");
+        assert_eq!(ThreadState::Ready.name(), "ready");
+        assert_eq!(ThreadState::Inactive.name(), "inactive");
+        assert_eq!(ThreadState::ShuttingDown.name(), "shutting down");
+        assert_eq!(ThreadState::Booting.name(), "booted");
+    }
+
+    #[test]
+    fn thread_state_stability() {
+        assert!(ThreadState::Ready.is_stable());
+        assert!(ThreadState::Inactive.is_stable());
+        assert!(!ThreadState::Reserved.is_stable());
+        assert!(!ThreadState::Booting.is_stable());
+    }
+
+    #[test]
+    fn status_when_not_running() {
+        // The global registry is not running during unit tests.
+        let status = status();
+        assert!(!status.is_running);
+        assert_eq!(status.num_threads, 0);
+        assert_eq!(status.ready_threads, 0);
+        assert!(threads().is_empty());
+    }
+}

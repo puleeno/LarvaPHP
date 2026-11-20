@@ -25,6 +25,7 @@
 
 pub mod cgi;
 pub mod cli;
+pub mod completions;
 pub mod config;
 pub mod context;
 pub mod embed;
@@ -50,6 +51,7 @@ pub use config::{
     ConfigLoader, ConfigParser, Middleware, MiddlewareChain, RewriteMiddleware, RewriteRule,
     ServerConfig, ServerConfigBuilder,
 };
+pub use completions::Shell;
 pub use errors::{Error, Result};
 pub use options::{Option, WorkerOption, ServerOption, RequestOption};
 pub use server::Server;

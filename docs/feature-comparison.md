@@ -162,15 +162,23 @@ This document compares the feature set of LarvaPHP (Rust) against FrankenPHP (Go
 - **php.ini config** — `Server::set_php_ini()` + repeatable `--php-ini` CLI flag → `write_ini_overrides()` (per-process cache) → `PHP_INI_SCAN_DIR`.
 - **HTTP/2** — served by `hyper_util::server::conn::auto::Builder` (already in use).
 
-### Medium Priority (Developer experience)
+### Medium Priority (Developer experience) — ✅ DONE
 
-7. **Mercure hub implementation** - `mercure.rs` is a stub
-8. **X-Sendfile** - Efficient large static file serving
-9. **Debug mode** - `CADDY_GLOBAL_OPTIONS=debug`
-10. **Shell completion** - Bash, Zsh, Fish, PowerShell
-11. **Worker manual restart API** - Admin endpoint for worker restart
-12. **Thread inspection API** - `frankenphp.Thread()` equivalent
-13. **resolve_root_symlink** - Symbolic link resolution for document root
+7. ✅ **Mercure hub implementation** — `mercure.rs` now has a real in-memory pub/sub hub (broadcast channel) with SSE formatting.
+8. ✅ **X-Sendfile** — `try_x_sendfile()` serves the file referenced by PHP's `X-Sendfile` header directly (efficient large-file serving).
+9. ✅ **Debug mode** — `--debug` CLI flag sets tracing to DEBUG level.
+10. ✅ **Shell completion** — `--completion bash|zsh|fish|powershell` (dependency-free generator in `completions.rs`).
+11. ⬜ **Worker manual restart API** — Admin endpoint for worker restart (not yet).
+12. ✅ **Thread inspection API** — `thread::threads()` / `status()` / `main_thread_state()` / `is_running()`.
+13. ⬜ **resolve_root_symlink** — Symbolic link resolution for document root (not yet).
+
+### Implemented (2026-11-20, medium priority)
+
+- **Mercure hub** — `mercure.rs`: `Hub` with `tokio::sync::broadcast`, `publish()`/`subscribe()`, `format_sse()`, `topic_matches()`, global `hub()`.
+- **X-Sendfile** — `server.rs::try_x_sendfile()`: serves referenced file (skips sensitive files), preserves CGI headers, recomputes content-type/length.
+- **Debug mode** — `main.rs --debug`: `tracing_subscriber::fmt().with_max_level(DEBUG)`.
+- **Shell completion** — `completions.rs`: `Shell` enum + embedded scripts for bash/zsh/fish/powershell; `main.rs --completion <shell>`.
+- **Thread inspection API** — `thread.rs`: `ThreadInfo`, `ThreadStatus`, `threads()`, `status()`, `main_thread_state()`, `is_running()`.
 
 ### Low Priority (Deployment/ecosystem)
 
